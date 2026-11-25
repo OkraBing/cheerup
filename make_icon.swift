@@ -10,7 +10,7 @@ func draw(_ px: Int) -> Data {
     let k = CGFloat(px) / 1024
     ctx.translateBy(x: 0, y: CGFloat(px)); ctx.scaleBy(x: k, y: -k)          // 之后都按 1024 的坐标画，y 向下
     let paper = NSColor(red: 0.949, green: 0.941, blue: 0.922, alpha: 1)
-    let red = NSColor(red: 0.878, green: 0.451, blue: 0.420, alpha: 1)
+    let red = NSColor(red: 0.42, green: 0.62, blue: 0.95, alpha: 1)          // 花球用蓝色：红或绿都会让人联想到涨跌
     // 底：macOS 图标的圆角方形，四周留边
     paper.setFill()
     NSBezierPath(roundedRect: NSRect(x: 100, y: 100, width: 824, height: 824), xRadius: 186, yRadius: 186).fill()

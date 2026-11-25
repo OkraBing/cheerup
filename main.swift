@@ -15,20 +15,22 @@ struct Config: Decodable {
     var stocks: [String] = ["sh000001", "600519", "00700", "AAPL", "NVDA"]
     var aliases: [String: String] = [:]
     var refreshSeconds: Double = 3
-    var opacity: Double = 0.35
+    var opacity: Double = 0.95
     var hoverOpacity: Double = 0.95
     var fontSize: Double = 11
     var color: Bool = true
     var theme: String = "dark"          // dark / light / none
     var label: String = "name"          // name / code
     var menuBarIcon: Bool = true
-    var hideFromScreenShare: Bool = true
+    var hideFromScreenShare: Bool = false
     var detailAutoCloseSeconds: Double = 5   // 详情展开后鼠标离开多久自动收起，0 = 不自动收
     var maxVisibleRows: Int = 8              // 小窗最多同时显示几行，超出的在列表里滚动
     var upColor: String = "red"              // A 股、港股页：涨用什么颜色，red 或 green
     var usGreenUp: Bool = true               // 美股页按当地习惯绿涨红跌
     var miniStyle: String = "cheer"          // 收起后的样子：cheer 啦啦队员 / face 笑脸
     var language: String = ""                // 界面语言：zh / en；空着表示还没选，先跟系统
+    var tabOrder: [String] = ["a", "hk", "us"]      // 市场标签从左到右的顺序
+    var uiSize: String = "m"                 // 面板整体大小：s / m / l / xl（文字、间距、图标一起等比放大）
     var mascotSize: String = "m"             // 收起后小人的大小：s / m / l
     var restSchedule: String = "auto"        // 小人什么时候休息：auto 跟随当前标签页的市场 / a / hk / us / never 永不休息
     var pomColor: String = "auto"            // 花球颜色：auto 跟随当前市场的涨色 / red / green / yellow / blue / white
@@ -37,7 +39,7 @@ struct Config: Decodable {
 
     enum Keys: String, CodingKey {
         case stocks, aliases, refreshSeconds, opacity, hoverOpacity, fontSize
-        case color, theme, label, menuBarIcon, hideFromScreenShare, detailAutoCloseSeconds, maxVisibleRows, upColor, usGreenUp, miniStyle, language, mascotSize, pomColor, restSchedule
+        case color, theme, label, menuBarIcon, hideFromScreenShare, detailAutoCloseSeconds, maxVisibleRows, upColor, usGreenUp, miniStyle, language, mascotSize, tabOrder, uiSize, pomColor, restSchedule
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +63,8 @@ struct Config: Decodable {
         miniStyle = try c.decodeIfPresent(String.self, forKey: .miniStyle) ?? d.miniStyle
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
         mascotSize = try c.decodeIfPresent(String.self, forKey: .mascotSize) ?? d.mascotSize
+        tabOrder = (try? c.decodeIfPresent([String].self, forKey: .tabOrder)) ?? d.tabOrder
+        uiSize = try c.decodeIfPresent(String.self, forKey: .uiSize) ?? d.uiSize
         pomColor = try c.decodeIfPresent(String.self, forKey: .pomColor) ?? d.pomColor
         restSchedule = try c.decodeIfPresent(String.self, forKey: .restSchedule) ?? d.restSchedule
     }
@@ -85,14 +89,14 @@ let defaultConfigText = """
   "stocks": ["sh000001", "600519", "00700", "AAPL", "NVDA"],
   "aliases": {},
   "refreshSeconds": 3,
-  "opacity": 0.35,
+  "opacity": 0.95,
   "hoverOpacity": 0.95,
   "fontSize": 11,
   "color": true,
   "theme": "dark",
   "label": "name",
   "menuBarIcon": true,
-  "hideFromScreenShare": true,
+  "hideFromScreenShare": false,
   "detailAutoCloseSeconds": 5,
   "maxVisibleRows": 8
 }
@@ -117,6 +121,10 @@ extension Config {
         if !["cheer", "face"].contains(miniStyle) { c.miniStyle = "cheer" }
         if !["zh", "en"].contains(language) { c.language = "" }
         if !["s", "m", "l"].contains(mascotSize) { c.mascotSize = "m" }
+        if !["s", "m", "l", "xl"].contains(uiSize) { c.uiSize = "m" }
+        var order: [String] = []                       // 顺序里只认三个市场，各出现一次；漏掉的补在后面
+        for id in tabOrder + ["a", "hk", "us"] where ["a", "hk", "us"].contains(id) && !order.contains(id) { order.append(id) }
+        c.tabOrder = order
         if !pomColors.contains(pomColor) { c.pomColor = "auto" }
         if !["auto", "a", "hk", "us", "never"].contains(restSchedule) { c.restSchedule = "auto" }
         return c
@@ -447,6 +455,21 @@ func parseMinutes(_ data: Data, code: String, market: Market) -> MinuteData {
 // MARK: - 啦啦队动作
 
 /// 小人的一个姿势。角度是手臂相对水平线的仰角（度）：-50 垂在身侧，0 平举，90 笔直向上
+/// 背手换花球的时间轴（x 从 0 到 1，整段 swapSeconds 秒）：
+/// 手收到身后 → 在身后微微掏一下 → 找到了，顿一下 → 拿出新的
+let swapSeconds = 1.6
+let swapIn = 0.26, swapFound = 0.58, swapOut = 0.68       // 时间轴上的几个节点：手到身后 / 找到了 / 开始拿出来
+func swapState(_ x: Double) -> (behind: CGFloat, dig: CGFloat, found: Bool) {
+    func ease(_ t: Double) -> CGFloat { let c = CGFloat(min(max(t, 0), 1)); return c * c * c * (c * (c * 6 - 15) + 10) }   // 起止都很缓
+    if x < swapIn { return (ease(x / swapIn), 0, false) }
+    if x < swapFound {
+        let t = (x - swapIn) / (swapFound - swapIn)
+        return (1, CGFloat(sin(t * 2 * .pi) * sin(t * .pi)), false)          // 只搓两下：一上一下，就一个来回
+    }
+    if x < swapOut { return (1, 0, true) }
+    return (1 - ease((x - swapOut) / (1 - swapOut)), 0, true)
+}
+
 struct Pose: Equatable {
     var aL: CGFloat = -50      // 左臂
     var aR: CGFloat = -50      // 右臂
@@ -460,13 +483,14 @@ struct Pose: Equatable {
     var face = 1               // 表情：0 闭眼  1 平时（半垂眼、平嘴）  2 用力（嘴张成小 o）  3 偷看（睁一只眼）  4 淡淡一笑
     var blink = false          // 这一瞬间在眨眼
     var z: CGFloat = 0         // 睡着时头边飘的 z：0 是没有，其余是飘到哪了（0–1 循环）
+    var tuck: CGFloat = 0      // 手往脸边收多少：0 是伸直，1 是手肘弯下来、花球贴在脸颊旁（「举手手」）
 
     func mix(_ o: Pose, _ t: CGFloat) -> Pose {
         func m(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
         return Pose(aL: m(aL, o.aL), aR: m(aR, o.aR), leg: m(leg, o.leg), liftL: m(liftL, o.liftL), liftR: m(liftR, o.liftR),
                     hop: m(hop, o.hop), lean: m(lean, o.lean), spin: m(spin, o.spin), toss: m(toss, o.toss),
                     face: t < 0.35 ? face : o.face,       // 表情不渐变：动作做到三分之一时换成下一个
-                    z: o.z)
+                    z: o.z, tuck: m(tuck, o.tuck))
     }
 
     /// 休息时也不是一动不动：慢慢呼吸、轻轻晃；睡着（市场休息）时头边飘 z，每隔一阵睁一只眼偷看一下
@@ -491,26 +515,26 @@ struct Pose: Equatable {
 /// 开场跳起举高、左右交替上举、平举展开、摆出一条往右上的斜线、像台阶一样一级级举高、最后大跳收在高举
 let cheerRoutine: [(pose: Pose, move: Double, hold: Double)] = [
     (Pose(), 0.40, 0.45),                                                                    // 预备，微笑
-    (Pose(aL: -60, aR: -60, leg: 4.6, hop: 3.0, face: 2), 0.20, 0.10),                       // 深蹲蓄力
-    (Pose(aL: 36, aR: 36, leg: 2.6, liftL: -1.2, liftR: -1.2, hop: -3.3, spin: 1, face: 2), 0.34, 0.16),   // 跳起，收腿，双手举成 V，在最高处停一下
+    (Pose(aL: -52, aR: -52, leg: 4.4, hop: 1.9, face: 2, tuck: 0.7), 0.24, 0.10),                       // 深蹲蓄力
+    (Pose(aL: 34, aR: 44, leg: 2.6, liftL: -1.2, liftR: -1.2, hop: -3.3, lean: -0.4, spin: 1, face: 2), 0.34, 0.16),   // 跳起，收腿，双手举成 V，在最高处停一下
     (Pose(aL: 28, aR: 28, leg: 4.2, hop: 1.8, spin: 1), 0.24, 0.08),                         // 落地，蹲一下缓冲
     (Pose(aL: 33, aR: 33, spin: 1), 0.16, 0.25),                                             // 站直定住
     (Pose(aL: 38, aR: 38, toss: 1, face: 2), 0.70, 0.12),                                    // 把花球抛起来，在空中转，接住
     (Pose(aL: -12, aR: 44, liftL: -2.2, lean: 0.8, spin: 1), 0.30, 0.30),                    // 右手上举，左手斜伸，抬左脚
     (Pose(aL: 44, aR: -12, liftR: -2.2, lean: -0.8, spin: 1), 0.30, 0.30),                   // 换边，抬右脚
-    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 2.4, spin: 1), 0.28, 0.14),                           // 双手平举，扎个马步
-    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 1.2, spin: 1), 0.14, 0.00),                           // 弹一下
-    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 2.4, spin: 1), 0.14, 0.18),                           // 再蹲
+    (Pose(aL: 0, aR: 0, leg: 5.6, hop: 1.9, spin: 1), 0.28, 0.14),                           // 双手平举，扎个马步
+    (Pose(aL: 0, aR: 0, leg: 5.6, hop: 1.0, spin: 1), 0.14, 0.00),                           // 弹一下
+    (Pose(aL: 0, aR: 0, leg: 5.6, hop: 1.9, spin: 1), 0.14, 0.18),                           // 再蹲
     (Pose(aL: -18, aR: 47, leg: 4.6, lean: 1.5, spin: 1), 0.30, 0.60),                       // 左手压低、右手高举，身体跟着倾：上涨的手势，但两臂不连成一条直线
-    (Pose(aL: -55, aR: -55, leg: 4.4, hop: 2.6, spin: 1, face: 2), 0.24, 0.12),              // 收回并蹲到底，用力
-    (Pose(aL: -15, aR: -15, leg: 4.0, hop: 1.5, spin: 1, face: 2), 0.16, 0.12),              // 台阶一：一级级站起来、把手举高
+    (Pose(aL: -50, aR: -50, leg: 4.2, hop: 1.8, spin: 1, face: 2, tuck: 0.7), 0.28, 0.12),              // 收回并蹲到底，用力
+    (Pose(aL: -15, aR: -15, leg: 4.0, hop: 1.1, spin: 1, face: 2, tuck: 0.3), 0.16, 0.12),              // 台阶一：一级级站起来、把手举高
     (Pose(aL: 12, aR: 12, leg: 3.6, hop: 0.4, spin: 1, face: 2), 0.16, 0.12),                // 台阶二
     (Pose(aL: 33, aR: 33, hop: -1.2, spin: 1, face: 2), 0.16, 0.12),                         // 台阶三
-    (Pose(aL: 44, aR: 44, leg: 6.8, hop: -3.6, spin: 4, face: 2), 0.36, 0.26),               // 大跳，手脚全打开成一个 X，在空中多停一会儿，花球跟着转
-    (Pose(aL: 26, aR: 26, leg: 4.4, hop: 2.0, spin: 4), 0.26, 0.08),                         // 落地，蹲一下
-    (Pose(aL: 33, aR: 33, spin: 4), 0.20, 0.20),                                             // 高举定住
+    (Pose(aL: 50, aR: 36, leg: 6.4, hop: -3.6, lean: 0.6, spin: 4, face: 2), 0.36, 0.26),               // 大跳，手脚全打开成一个 X，在空中多停一会儿，花球跟着转
+    (Pose(aL: 26, aR: 26, leg: 4.4, hop: 1.5, spin: 4), 0.26, 0.08),                         // 落地，蹲一下
+    (Pose(aL: 40, aR: 16, leg: 4.0, hop: 1.1, lean: 0.8, spin: 4), 0.20, 0.30),                 // 一手高一手低，微蹲，歪头
     (Pose(aL: 38, aR: 38, toss: 1, face: 2), 0.85, 0.00),                                    // 再抛一次，抛得更高
-    (Pose(aL: 33, aR: 33, face: 4), 0.12, 0.85),                                             // 接住，淡淡一笑
+    (Pose(aL: 16, aR: 40, leg: 4.0, hop: 1.1, lean: -0.8, face: 4), 0.16, 0.85),                // 接住，换一边，微蹲歪头，淡淡一笑
     (Pose(face: 0), 0.50, 1.20),                                                    // 放下，闭眼歇一口气再来
 ]
 let cheerRoutineLength: Double = cheerRoutine.reduce(0) { $0 + $1.move + $1.hold }
@@ -539,7 +563,14 @@ func cheerPose(at time: Double) -> Pose {
             return r
         }
         t -= step.move
-        if t < step.hold { return step.pose }
+        if t < step.hold {
+            var r = step.pose
+            // 定住的时候也不是僵着：脚不离地，轻轻弹两下（闭眼歇气和腾空的那几拍除外）
+            if step.hold >= 0.25, r.hop > -0.5, r.face != 0, r.aL > 0 || r.aR > 0 {      // 只在举着手的定格上弹
+                r.hop += 0.35 * CGFloat(abs(sin(.pi * t / 0.3)) * sin(.pi * t / step.hold))
+            }
+            return r
+        }
         t -= step.hold
         prev = step.pose
         if prev.toss >= 1 { prev.toss = 0 }        // 抛完已经接住了，下一个动作从「在手里」接上
@@ -605,6 +636,99 @@ func gloss(_ id: String) -> String? {
     }
 }
 
+/// 拉拉队的右键气泡：像它说出来的一句话，右边一个小尖角指着它的脑袋；底色、字、悬停高亮和面板一致
+final class BubbleView: NSView {
+    var items: [(icon: String, text: String)] = [] { didSet { needsDisplay = true } }
+    var onPick: ((Int) -> Void)?
+    var theme = "dark" { didSet { needsDisplay = true } }
+    var fontSize: CGFloat = 11
+    var tailY: CGFloat = 20                 // 尖角指向的高度（拉拉队脑袋的位置）
+    var hover: Int? { didSet { if hover != oldValue { needsDisplay = true } } }
+    var pressed: Int? { didSet { if pressed != oldValue { needsDisplay = true } } }      // 按下去还没松手的那一项
+    static let tail: CGFloat = 6
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    private var font: NSFont { .monospacedDigitSystemFont(ofSize: fontSize, weight: .regular) }
+    private var rowH: CGFloat { ceil(fontSize * 1.85) }
+    private var cap: CGFloat { ceil(fontSize * 1.28) }        // 字母按键帽的边长
+    private var ink: NSColor { theme == "light" ? NSColor(white: 0.15, alpha: 1) : NSColor(white: 0.88, alpha: 1) }
+    func fittingSize() -> NSSize {
+        let w = (items.map { ($0.text as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0)
+        return NSSize(width: ceil(8 + cap + 7 + w + 12 + BubbleView.tail), height: rowH * CGFloat(items.count) + 8)
+    }
+    private func rowRect(_ i: Int) -> NSRect { NSRect(x: 3, y: 4 + CGFloat(i) * rowH, width: bounds.width - BubbleView.tail - 6, height: rowH) }
+    /// 这个点（本视图坐标）落在第几项上
+    func row(at p: NSPoint) -> Int? { items.indices.first { rowRect($0).contains(p) } }
+    // 悬停不靠鼠标事件（气泡是在鼠标不动的时候冒出来的，收不到移动事件），由外面每帧按鼠标位置设 hover
+    override func mouseDown(with event: NSEvent) { pressed = row(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseDragged(with event: NSEvent) { if pressed != nil, row(at: convert(event.locationInWindow, from: nil)) != pressed { pressed = nil } }
+    override func mouseUp(with event: NSEvent) {
+        let i = row(at: convert(event.locationInWindow, from: nil))
+        guard let k = pressed, k == i else { pressed = nil; return }
+        // 松手后那一项的按下效果多留一瞬再执行，看得出点中了
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in self?.pressed = nil; self?.onPick?(k) }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        // 外形是一笔画成的：圆角和面板一样大，右边的小尖角是从边上平滑鼓出来的一个小弧，不是硬贴上去的三角
+        let bodyW = bounds.width - BubbleView.tail, h = bounds.height, r: CGFloat = 7
+        let ty = min(max(tailY, r + 7), h - r - 7), tw: CGFloat = 5.5, tip = bounds.width - 0.5
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: r, y: 0))
+        path.appendArc(from: NSPoint(x: bodyW, y: 0), to: NSPoint(x: bodyW, y: r), radius: r)
+        path.line(to: NSPoint(x: bodyW, y: ty - tw))
+        path.curve(to: NSPoint(x: tip, y: ty), controlPoint1: NSPoint(x: bodyW, y: ty - tw * 0.45), controlPoint2: NSPoint(x: tip - 1.5, y: ty - 1.6))
+        path.curve(to: NSPoint(x: bodyW, y: ty + tw), controlPoint1: NSPoint(x: tip - 1.5, y: ty + 1.6), controlPoint2: NSPoint(x: bodyW, y: ty + tw * 0.45))
+        path.appendArc(from: NSPoint(x: bodyW, y: h), to: NSPoint(x: bodyW - r, y: h), radius: r)
+        path.appendArc(from: NSPoint(x: 0, y: h), to: NSPoint(x: 0, y: h - r), radius: r)
+        path.appendArc(from: NSPoint(x: 0, y: 0), to: NSPoint(x: r, y: 0), radius: r)
+        path.close()
+        (theme == "light" ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0.08, alpha: 0.8)).setFill()
+        path.fill()
+        for (i, it) in items.enumerated() {
+            let r = rowRect(i), down = pressed == i, on = hover == i || down
+            if on { ink.withAlphaComponent(down ? 0.3 : 0.16).setFill(); NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5).fill() }
+            let tint = on ? ink : ink.withAlphaComponent(0.6)
+            let box = NSRect(x: r.minX + 5, y: r.midY - cap / 2, width: cap, height: cap)
+            if it.icon == "rest" || it.icon == "cheer" {
+                // 字母画成一个小键帽：一看就知道是可以按的键（休息 R、加油 C）
+                let key = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), xRadius: 3.5, yRadius: 3.5)
+                ink.withAlphaComponent(on ? 0.2 : 0.1).setFill(); key.fill()
+                ink.withAlphaComponent(on ? 0.55 : 0.3).setStroke(); key.lineWidth = 1; key.stroke()
+                let letter = it.icon == "rest" ? "R" : "C"
+                let la: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: fontSize * 0.78, weight: .semibold), .foregroundColor: tint]
+                let ls = (letter as NSString).size(withAttributes: la)
+                (letter as NSString).draw(at: NSPoint(x: box.midX - ls.width / 2, y: box.midY - ls.height / 2), withAttributes: la)
+            } else {                                            // 退出：只是一个叉，没有键帽（它没有快捷键）
+                let k = fontSize * 0.27, g = NSBezierPath()
+                g.move(to: NSPoint(x: box.midX - k, y: box.midY - k)); g.line(to: NSPoint(x: box.midX + k, y: box.midY + k))
+                g.move(to: NSPoint(x: box.midX + k, y: box.midY - k)); g.line(to: NSPoint(x: box.midX - k, y: box.midY + k))
+                g.lineWidth = 1.2; g.lineCapStyle = .round
+                tint.setStroke(); g.stroke()
+            }
+            let a: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: on ? ink : ink.withAlphaComponent(0.8)]
+            let th = (it.text as NSString).size(withAttributes: a).height
+            (it.text as NSString).draw(at: NSPoint(x: box.maxX + 7, y: r.midY - th / 2), withAttributes: a)
+        }
+    }
+}
+
+/// 窗口里的两块：上面右角站着拉拉队，下面是面板。收起时只剩拉拉队那一块，所以它在屏幕上的位置不动
+final class StageView: NSView {
+    var board: NSView?
+    var mascot: NSView?
+    var top: CGFloat = 0 { didSet { relayout() } }       // 面板上沿离窗口顶部多远（拉拉队的脚踩在这条线上）
+    var side: CGFloat = 0 { didSet { relayout() } }      // 拉拉队那一块的边长
+    var scale: CGFloat = 1 { didSet { relayout() } }     // 面板整体放大多少倍（拉拉队不跟着变，它有自己的大小设置）
+    override var isFlipped: Bool { true }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); relayout() }
+    func relayout() {
+        mascot?.frame = NSRect(x: bounds.width - side, y: 0, width: side, height: side)
+        board?.frame = NSRect(x: 0, y: top, width: bounds.width, height: max(0, bounds.height - top))
+        if let b = board { b.setBoundsSize(NSSize(width: b.frame.width / scale, height: b.frame.height / scale)) }     // 面板里面按原来的尺寸画，整体放大
+    }
+}
+
 final class BoardView: NSView, NSTextFieldDelegate {
     // —— 页面（添加 / 菜单 / 引导）——
     var page: Page = .list
@@ -658,7 +782,9 @@ final class BoardView: NSView, NSTextFieldDelegate {
     var onArrow: ((Int) -> Void)?       // 列表页按了 ↑(-1) / ↓(+1)
     var keyNav = false                  // 菜单 / 设置页里用过方向键：显示键盘选中的那一行
     override var acceptsFirstResponder: Bool { true }
+    var onKey: ((String) -> Bool)?        // 外面想先接的按键（比如气泡开着时的 R / C）；返回 true 表示已经处理了
     override func keyDown(with event: NSEvent) {
+        if let h = onKey, !event.modifierFlags.contains(.command), let ch = event.charactersIgnoringModifiers?.lowercased(), h(ch) { return }
         if let d = dropdown {        // 下拉列表开着：方向键在选项里移动
             switch event.keyCode {
             case 125: dropSel = (dropSel + 1) % d.options.count; needsDisplay = true
@@ -740,6 +866,10 @@ final class BoardView: NSView, NSTextFieldDelegate {
     var onReorder: ((Int, Int) -> Void)?     // 把第几行拖到了第几行
     private var dragFrom: Int?
     private var dragTo: Int?                 // 松手后插到第几行前面
+    var onReorderTab: ((Int, Int) -> Void)?  // 把第几个市场标签拖到了第几个
+    var onTabMenu: ((Int) -> Void)?          // 在第几个市场标签上点了右键
+    private var tabDragFrom: Int?
+    private var tabDragTo: Int?              // 松手后插到第几个标签前面
     private var tipReady = false        // 鼠标在同一行停够了时间，可以显示全名
     private var tipTimer: Timer?
     var debugRow: Int?                  // 调试用：固定显示某一行的悬停效果，不被真实鼠标冲掉
@@ -759,9 +889,119 @@ final class BoardView: NSView, NSTextFieldDelegate {
     private let sparkH: CGFloat = 46, pairGap: CGFloat = 8, colGap: CGFloat = 16
     let miniSize: CGFloat = 38
     var detailAlpha: CGFloat = 1        // 详情区的透明度，过渡动画用
-    var pose = Pose()                   // 啦啦队员现在的姿势
+    var pose = Pose() { didSet { stepSecondary() } }      // 啦啦队员现在的姿势
+    // 跟随动作：花球和头不是钉死在手上、脖子上，而是被带着走，会慢半拍、甩过头再晃回来
+    private var pomPos: [NSPoint] = []         // 两个花球现在在哪（以小人的 38 格为单位）
+    private var pomVel: [NSPoint] = [.zero, .zero]
+    private var headOff = NSPoint.zero         // 头相对脖子偏了多少
+    private var headVel = NSPoint.zero
+    private var lastHead: NSPoint?
+    private var flutter: CGFloat = 0           // 花球穗子抖动的相位
+    private var lastStep = 0.0
+    var fixedStep: Double?                     // 调试用：离屏画连环画时每次姿势更新算多长时间
+
+    /// 画的时候用的姿势：腿比原来短一点（胯以上整体往下放），显得更圆更可爱；脚的位置不变
+    private let legCut: CGFloat = 0.9
+    private var drawnPose: Pose { var q = pose; q.hop += legCut; return q }
+
+    /// 手臂的三个点（肩、肘、手），以 38 格为单位
+    private func armPoints(_ p: Pose) -> [(sh: NSPoint, elbow: NSPoint, h: NSPoint)] {
+        let shoulder = NSPoint(x: 19 + p.lean, y: 17.4 + p.hop)
+        let sides: [(CGFloat, CGFloat)] = [(-1.0, p.aL), (1.0, p.aR)]
+        var out: [(sh: NSPoint, elbow: NSPoint, h: NSPoint)] = []
+        for (side, deg) in sides {
+            // 背手换花球时：手收到后腰，手肘往外撑开
+            let a = (deg + (-78 - deg) * behind) * .pi / 180
+            let full: CGFloat = 10.0                         // 手臂伸直有多长（原来是 11，改短了一点）
+            let reach = full - 4.9 * behind - 3.2 * p.tuck * (1 - behind)
+            // 两个肩膀左右错开一点
+            let sh = NSPoint(x: shoulder.x + side * 1.0, y: shoulder.y)
+            let d = dig * side                       // 翻找时两只手反着动：一只往上够，另一只往下探
+            var h = NSPoint(x: sh.x + side * cos(a) * reach, y: sh.y - sin(a) * reach + d * 0.5)
+            // 手举到头边时花球挨着脸颊，但不盖到脸上
+            let headC = NSPoint(x: 19 + p.lean * 1.25, y: 10.4 + p.hop), keep: CGFloat = 5.4 + 4.0
+            let gx = h.x - headC.x, gy = h.y - headC.y, gd = max(hypot(gx, gy), 0.001)
+            if gd < keep, behind < 0.01 {
+                let ox = abs(gx) < 0.5 ? side : gx / gd, oy = abs(gx) < 0.5 ? -0.3 : gy / gd, on = hypot(ox, oy)
+                h = NSPoint(x: headC.x + ox / on * keep, y: headC.y + oy / on * keep)
+            }
+            // 「嗯？」：右手抬到下巴旁边（花球挨着下颌，不盖住脸），手肘自然垂下去
+            if side > 0, curious > 0.001, behind < 0.01 {
+                let chin = NSPoint(x: headC.x + 6.0, y: headC.y + 6.6)
+                h = NSPoint(x: h.x + (chin.x - h.x) * curious, y: h.y + (chin.y - h.y) * curious)
+            }
+            // 手肘：手离肩膀比臂长近多少，手肘就弯出去多少（朝下、朝外），所以收手时是弯的，伸直时是直的
+            let ax: CGFloat = h.x - sh.x, ay: CGFloat = h.y - sh.y
+            let al: CGFloat = max(hypot(ax, ay), 0.01)
+            // 手肘一律朝外、略微朝下弯。不能按「垂直于手臂」来算：手垂在身侧时那个方向是朝上的，
+            // 手肘会耸到肩膀上面去，手臂像从脖子横着长出来，还会蹭到头的下沿
+            let nx: CGFloat = side * 0.92, ny: CGFloat = 0.39
+            let slack: CGFloat = max(0, full * full - al * al)
+            let bendOut: CGFloat = sqrt(slack) / 2 * 0.95 * (1 - behind)
+            let sag: CGFloat = (0.5 + 1.2 * abs(cos(a))) * (1 - behind) * (1 - p.tuck)      // 伸直时也微微往下坠一点，不是直棍
+            let ex: CGFloat = (sh.x + h.x) / 2 + nx * bendOut + side * (0.5 * sin(a) + (2.2 - d * 0.4) * behind)
+            let ey: CGFloat = (sh.y + h.y) / 2 + ny * bendOut + sag + d * 0.35
+            var elbow = NSPoint(x: ex, y: ey)
+            // 举起的手臂如果贴着头的边缘过去，会把头的轮廓线盖掉一段：手肘往外弓，让整条手臂离头远一点
+            if behind < 0.01 {
+                let vx: CGFloat = h.x - sh.x, vy: CGFloat = h.y - sh.y
+                let tt: CGFloat = min(max(((headC.x - sh.x) * vx + (headC.y - sh.y) * vy) / max(vx * vx + vy * vy, 0.01), 0.25), 1)
+                let qx: CGFloat = sh.x + vx * tt - headC.x, qy: CGFloat = sh.y + vy * tt - headC.y
+                let qd: CGFloat = max(hypot(qx, qy), 0.01), need: CGFloat = 5.4 + 2.3        // 手臂连描边有 1.9 宽：离头这么远才不会把头的轮廓线盖掉；再多就会弓成方方的 U 形
+                if qd < need { elbow.x += qx / qd * (need - qd) * 1.25; elbow.y += qy / qd * (need - qd) * 1.25 }
+            }
+            out.append((sh, elbow, h))
+        }
+        return out
+    }
+    /// 花球该在的位置：平时在手上，抛起来时沿一条弧线离开手
+    private func pomTargets(_ p: Pose) -> [NSPoint] {
+        let arc = 4 * p.toss * (1 - p.toss)                          // 0 → 1 → 0 的抛物线
+        return armPoints(p).enumerated().map { i, a in NSPoint(x: a.h.x + (i == 0 ? -1 : 1) * 1.0 * arc, y: a.h.y - 7 * arc) }
+    }
+    /// 姿势每变一次，花球和头按弹簧往该在的位置追一步
+    private func stepSecondary() {
+        let now = CACurrentMediaTime()
+        var dt = fixedStep ?? min(max(now - lastStep, 1.0 / 120), 1.0 / 15)
+        lastStep = now
+        let targets = pomTargets(drawnPose), head = NSPoint(x: 19 + pose.lean * 1.25, y: 10.4 + pose.hop)
+        if pomPos.count != 2 || behind > 0.02 { pomPos = targets; pomVel = [.zero, .zero]; lastHead = head; return }      // 背手换花球时花球牢牢握在手里，不晃
+        let headMove = NSPoint(x: head.x - (lastHead ?? head).x, y: head.y - (lastHead ?? head).y)
+        lastHead = head
+        headOff.x -= headMove.x * 0.5; headOff.y -= headMove.y * 0.5          // 身子一动，头先留在原地一点，再追上来
+        while dt > 0 {
+            let h = CGFloat(min(dt, 1.0 / 120)); dt -= 1.0 / 120
+            for i in 0..<2 {                                   // 花球：弹一点，甩过头再晃回来
+                let w: CGFloat = 24, z: CGFloat = 0.42
+                pomVel[i].x += (w * w * (targets[i].x - pomPos[i].x) - 2 * z * w * pomVel[i].x) * h
+                pomVel[i].y += (w * w * (targets[i].y - pomPos[i].y) - 2 * z * w * pomVel[i].y) * h
+                pomPos[i].x += pomVel[i].x * h; pomPos[i].y += pomVel[i].y * h
+                let dx = pomPos[i].x - targets[i].x, dy = pomPos[i].y - targets[i].y, d = hypot(dx, dy), lim: CGFloat = 1.4
+                if d > lim { pomPos[i] = NSPoint(x: targets[i].x + dx / d * lim, y: targets[i].y + dy / d * lim) }      // 花球是握在手里的，不会甩太远
+            }
+            let w: CGFloat = 30, z: CGFloat = 0.5              // 头：轻轻点一下
+            headVel.x += (-w * w * headOff.x - 2 * z * w * headVel.x) * h; headVel.y += (-w * w * headOff.y - 2 * z * w * headVel.y) * h
+            headOff.x += headVel.x * h; headOff.y += headVel.y * h
+            let hd = hypot(headOff.x, headOff.y); if hd > 0.8 { headOff = NSPoint(x: headOff.x / hd * 0.8, y: headOff.y / hd * 0.8) }
+            flutter += h * 34 * min(1, (hypot(pomVel[0].x, pomVel[0].y) + hypot(pomVel[1].x, pomVel[1].y)) / 30)
+        }
+    }
     var zFade: CGFloat = 1              // 睡着时 z 的淡入程度
     var facing = false                  // 鼠标停在它身上：转过来面对你，脚尖朝前
+    var onBoard = false                 // 站在展开的面板上沿：脚下不用再画那道横线
+    var behind: CGFloat = 0             // 换花球：手背到身后的程度（0 没有，1 完全背过去，花球收在身后看不见）
+    var dig: CGFloat = 0                // 在身后翻找：-1…1，两只手一上一下
+    var curious: CGFloat = 0            // 鼠标停在它身上时的「嗯？」：0 没有，1 完全摆好（一只手抬到下巴边、头边冒个问号）
+    var showClose = false               // 鼠标在拉拉队身上：头的右上角露出「隐藏」的小叉
+    var closeHot = false                // 鼠标正指着那个小叉
+    var closeRect: NSRect {              // 和标题条的按钮一样大；紧挨着头的右上角，不放在角落里
+        let u = bounds.width / 38
+        let cx = min(19 * u + 5.4 * u * 0.72 + 9, bounds.width - 9), cy = max(11.3 * u - 5.4 * u * 0.72 - 8, 9)
+        return NSRect(x: cx - 8, y: cy - 8, width: 16, height: 16)
+    }
+    var fold: CGFloat?                  // 面板正在收成拉拉队脚下那道横线：0 刚开始，1 收完；nil = 没在收
+    var foldScale: CGFloat = 1          // 面板整体放大的倍数
+    var foldSide: CGFloat = 88          // 拉拉队那一块的边长，用来算横线最后落在哪
     var gaze = NSPoint.zero             // 眼睛往哪边看（-1…1）：鼠标停在它身上时看向鼠标
     private var stableW: [Bool: CGFloat] = [:]   // 每种模式用过的最大宽度，只增不减，避免数字位数变化时抖动
     private var stableSig = ""
@@ -780,7 +1020,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
     private var smallFont: NSFont { .monospacedDigitSystemFont(ofSize: max(CGFloat(cfg.fontSize) - 2.5, 7), weight: .regular) }
 
     /// 按钮从左往右：添加、菜单、收成笑脸、隐藏
-    private let btnCount = 4
+    private var btnCount: Int { cfg.miniStyle == "face" ? 4 : 3 }      // 有拉拉队时「隐藏」搬到了它头边，标题条只剩三个
     private func btnRect(_ i: Int) -> NSRect {
         let right = bounds.width - 5
         return NSRect(x: right - btnW * CGFloat(btnCount - i), y: headerTop, width: btnW, height: headerH)     // 等宽、等距
@@ -819,11 +1059,20 @@ final class BoardView: NSView, NSTextFieldDelegate {
         downAt = event.locationInWindow; dragging = false
         dragFrom = (page == .list && !mini && dropdown == nil) ? rowAt(convert(event.locationInWindow, from: nil)) : nil
         dragTo = nil
+        tabDragFrom = (page == .list && !mini && dropdown == nil) ? tabAt(convert(event.locationInWindow, from: nil)) : nil
+        tabDragTo = nil
     }
     override func mouseDragged(with event: NSEvent) {
         guard let d = downAt else { return }
         let p = event.locationInWindow
         if !dragging, abs(p.x - d.x) <= 3, abs(p.y - d.y) <= 3 { return }
+        if tabDragFrom != nil, tabs.count > 1 {       // 拖市场标签：调整标签的顺序
+            dragging = true
+            let x = convert(p, from: nil).x
+            let t = tabs.indices.filter { tabRect($0).midX < x }.count
+            if t != tabDragTo { tabDragTo = t; needsDisplay = true }
+            return
+        }
         if dragFrom != nil, rows.count > 1 {          // 在列表里拖：调整顺序
             dragging = true
             let y = convert(p, from: nil).y
@@ -842,7 +1091,14 @@ final class BoardView: NSView, NSTextFieldDelegate {
             return
         }
         dragFrom = nil; dragTo = nil
+        if let from = tabDragFrom, let to = tabDragTo, dragging {
+            tabDragFrom = nil; tabDragTo = nil; needsDisplay = true
+            if to != from, to != from + 1 { onReorderTab?(from, to > from ? to - 1 : to) }
+            return
+        }
+        tabDragFrom = nil; tabDragTo = nil
         guard downAt != nil, !dragging else { return }
+        if mini, showClose, closeRect.insetBy(dx: -2, dy: -2).contains(convert(event.locationInWindow, from: nil)) { onClose?(); return }
         if mini { onToggleMini?(); return }
         let p = convert(event.locationInWindow, from: nil)
         if let d = dropdown {         // 下拉列表开着：点选项就选，点别处就收起
@@ -854,7 +1110,8 @@ final class BoardView: NSView, NSTextFieldDelegate {
         if page != .list {
             if p.y < listTop {
                 if let a = pageAction, btnRect(btnCount - 2).contains(p) { a.action() }
-                else if backRect.contains(p) || btnRect(btnCount - 1).contains(p) { onBack?() }
+                else if btnRect(btnCount - 1).contains(p) { onToggleMini?() }
+                else if backRect.contains(p) { onBack?() }
                 return
             }
             let L = pageLayout()
@@ -986,7 +1243,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
 
     /// 小窗应有的大小。宽度在同一种模式下固定：列表和详情共用一个宽度，切换股票不会变宽变窄
     func size(withDetail: Bool) -> NSSize {
-        if mini { let m: CGFloat = cfg.miniStyle == "face" ? miniSize : (["s": 52, "l": 88][cfg.mascotSize] ?? 68); return NSSize(width: m, height: m) }
+        if mini { let m: CGFloat = cfg.miniStyle == "face" ? miniSize : (["s": 68, "l": 112][cfg.mascotSize] ?? 88); return NSSize(width: m, height: m) }
         if page != .list {
             let w = max(ceil(CGFloat(cfg.fontSize) * 21), stableW[false] ?? 0)
             return NSSize(width: w, height: pageLayout(width: w).bottom)
@@ -1075,10 +1332,14 @@ final class BoardView: NSView, NSTextFieldDelegate {
         }
         let cr = btnRect(btnCount - 1)
         if hoverBtn == btnCount - 1 { textColor.withAlphaComponent(0.16).setFill(); NSBezierPath(roundedRect: cr.insetBy(dx: 1, dy: 0), xRadius: 4, yRadius: 4).fill() }
+        // 页面右上角是「收起」（和列表页的收起同一个图标）；回上一页用左上角的箭头
         let x = NSBezierPath(); let c = NSPoint(x: cr.midX, y: headMid), k: CGFloat = 3.5
-        x.move(to: NSPoint(x: c.x - k, y: c.y - k)); x.line(to: NSPoint(x: c.x + k, y: c.y + k))
-        x.move(to: NSPoint(x: c.x + k, y: c.y - k)); x.line(to: NSPoint(x: c.x - k, y: c.y + k))
-        x.lineWidth = 1.2; x.lineCapStyle = .round
+        for sg in [1.0, -1.0] as [CGFloat] {
+            let tip = NSPoint(x: c.x + sg * 0.9, y: c.y - sg * 0.9)
+            x.move(to: NSPoint(x: c.x + sg * (k + 0.3), y: c.y - sg * (k + 0.3))); x.line(to: tip)
+            x.move(to: NSPoint(x: tip.x, y: tip.y - sg * 2.6)); x.line(to: tip); x.line(to: NSPoint(x: tip.x + sg * 2.6, y: tip.y))
+        }
+        x.lineWidth = 1.2; x.lineCapStyle = .round; x.lineJoinStyle = .round
         (hoverBtn == btnCount - 1 ? textColor : dimColor).setStroke(); x.stroke()
 
         // 搜索行：放大镜 + 输入框 + 底下一条细线，不另外套框
@@ -1506,7 +1767,24 @@ final class BoardView: NSView, NSTextFieldDelegate {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        if mini, cfg.miniStyle != "face" { drawCheer(); return }      // 啦啦队员没有底色，像桌宠一样直接站在桌面上
+        if let t = fold { drawFold(t); return }
+        if mini, cfg.miniStyle != "face" {       // 啦啦队员没有底色，像桌宠一样直接站在桌面上
+            drawCheer()
+            if showClose {
+                // 和标题条里的按钮同一个样子：面板底色的小圆角块，细线的叉；指着它时变亮
+                let r = closeRect, k: CGFloat = 3.5
+                (cfg.theme == "light" ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0.08, alpha: 0.8)).setFill()
+                NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+                if closeHot { textColor.withAlphaComponent(0.16).setFill(); NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill() }
+                let x = NSBezierPath()
+                x.move(to: NSPoint(x: r.midX - k, y: r.midY - k)); x.line(to: NSPoint(x: r.midX + k, y: r.midY + k))
+                x.move(to: NSPoint(x: r.midX + k, y: r.midY - k)); x.line(to: NSPoint(x: r.midX - k, y: r.midY + k))
+                x.lineWidth = 1.2; x.lineCapStyle = .round
+                let ink = cfg.theme == "light" ? NSColor(white: 0.15, alpha: 1) : NSColor(white: 0.93, alpha: 1)
+                (closeHot ? ink : ink.withAlphaComponent(0.55)).setStroke(); x.stroke()
+            }
+            return
+        }
         if cfg.theme != "none" {
             (cfg.theme == "light" ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0.08, alpha: 0.8)).setFill()
             let r: CGFloat = mini ? miniSize / 2 : 7
@@ -1529,6 +1807,10 @@ final class BoardView: NSView, NSTextFieldDelegate {
                 if on { textColor.withAlphaComponent(0.8).setFill(); NSRect(x: r.minX + 6, y: r.maxY, width: r.width - 12, height: 1).fill() }
                 sx = r.maxX + 4
             }
+        }
+        if let to = tabDragTo, dragging, tabs.count > 1 {        // 拖标签时：一条竖线标出松手后会插到哪
+            let x = to < tabs.count ? tabRect(to).minX + 2 : tabRect(tabs.count - 1).maxX - 2
+            textColor.setFill(); NSRect(x: x - 0.75, y: headerTop + 1, width: 1.5, height: headerH - 1).fill()
         }
         let statusW = btnRect(0).minX - sx - 6
         if statusW > 20 {
@@ -1643,14 +1925,38 @@ final class BoardView: NSView, NSTextFieldDelegate {
         }
     }
 
+    /// 收起的过程：面板不是一下子消失，底板一边缩一边变成拉拉队脚下那道横线
+    private func drawFold(_ e: CGFloat) {
+        // 面板可能整体放大了：这一段按屏幕上的点来画，才能和拉拉队脚下的横线对上
+        NSGraphicsContext.saveGraphicsState(); defer { NSGraphicsContext.restoreGraphicsState() }
+        let zoom = NSAffineTransform(); zoom.scale(by: 1 / foldScale); zoom.concat()
+        let bw = bounds.width * foldScale, bh = bounds.height * foldScale
+        let u = foldSide / 38, sw = pow(u, 0.85), top = floor(foldSide * 33.0 / 38)
+        // 终点：小人脚下那道横线（13.5–24.5、y 33.4，灰色本体 1.5 粗，外面一圈深色描边），换算到这块视图里
+        let x0 = bw - foldSide + 13.5 * u, x1 = bw - foldSide + 24.5 * u, cy = 33.4 * u - top
+        let outerEnd = NSRect(x: x0 - 1.5 * sw, y: cy - 1.5 * sw, width: x1 - x0 + 3 * sw, height: 3 * sw)
+        func m(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * e }
+        let r = NSRect(x: m(0, outerEnd.minX), y: m(0, outerEnd.minY), width: m(bw, outerEnd.width), height: m(bh, outerEnd.height))
+        let rad = min(m(7, r.height / 2), r.height / 2)
+        let a0: CGFloat = cfg.theme == "none" ? 0 : (cfg.theme == "light" ? 0.85 : 0.8), w0: CGFloat = cfg.theme == "light" ? 1 : 0.08
+        let k = e * e                                   // 颜色靠后才变：从面板底色变成横线的描边色和灰
+        NSColor(white: w0 + (0.17 - w0) * k, alpha: a0 + (1 - a0) * k).setFill()
+        NSBezierPath(roundedRect: r, xRadius: rad, yRadius: rad).fill()
+        let inset = 0.75 * sw * k, ir = r.insetBy(dx: inset, dy: inset)
+        if k > 0.02, ir.height > 0 {
+            NSColor(white: 0.55, alpha: k).setFill()
+            NSBezierPath(roundedRect: ir, xRadius: ir.height / 2, yRadius: ir.height / 2).fill()
+        }
+    }
+
     /// 收起后的啦啦队员：和标题条图标同一套笔画的小符号（像终端里的 \o/）。
     /// 没有底色，直接站在桌面上；线条外面有一圈很淡的反色描边，深色浅色桌面上都看得清。
     private func drawCheer() { drawCheerPass(1) }
 
     private func drawCheerPass(_ pass: Int) {
         let u = min(bounds.width, bounds.height) / 38
-        let p = pose
-        let lift = min(p.hop, 0)                                       // 跳起来时整个人离地；下蹲时脚不动
+        let p = drawnPose
+        let lift = min(pose.hop, 0)                                    // 跳起来时整个人离地；下蹲时脚不动
         func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * u, y: y * u) }
         let light = false                              // 小人永远是白线加深色描边，不随浅色主题变黑
         let ink = light ? NSColor(white: 0.12, alpha: 1) : NSColor(white: 0.93, alpha: 1)
@@ -1675,12 +1981,12 @@ final class BoardView: NSView, NSTextFieldDelegate {
         }
         // 脚下一道短横线，像终端里的光标；人跳起来时它留在原地
         let ground = NSBezierPath(); ground.move(to: pt(13.5, 33.4)); ground.line(to: pt(24.5, 33.4))
-        stroke(ground, 1.5, NSColor(white: 0.55, alpha: 1))
+        if !onBoard { stroke(ground, 1.5, NSColor(white: 0.55, alpha: 1)) }
 
         // 不穿衣服，就是线条小人。比例上躯干短、腿长：肩膀紧挨着头，胯在身体中间偏上，不会显得脖子一根到底
         let hipY = 21.6 + p.hop, shoulder = pt(19 + p.lean, 17.4 + p.hop)
         let body = NSBezierPath()
-        body.move(to: pt(19 + p.lean, 15.6 + p.hop)); body.line(to: pt(19, hipY))                 // 躯干
+        body.move(to: pt(19 + p.lean, 14.4 + p.hop)); body.line(to: pt(19, hipY))                 // 躯干（顶上伸进头里一点，头晃的时候脖子不会断）
         for (side, footLift) in [(-1.0, p.liftL), (1.0, p.liftR)] as [(CGFloat, CGFloat)] {
             let ax = 19 + side * p.leg, ay = 30.4 + lift + footLift
             let airborne = lift + footLift < -0.4          // 离地时脚尖往下压，落地时脚掌放平
@@ -1695,26 +2001,32 @@ final class BoardView: NSView, NSTextFieldDelegate {
         // 手臂和花球的路径先算好，等脑袋画完再画，这样举起来时手和花球在脑袋前面
         var hands: [NSPoint] = []
         let arms = NSBezierPath()
-        for (side, deg) in [(-1.0, p.aL), (1.0, p.aR)] as [(CGFloat, CGFloat)] {
-            let a = deg * .pi / 180
-            // 两个肩膀左右错开一点；手臂不是直棍，手肘处微微往下坠，越接近平举坠得越明显
-            let sh = NSPoint(x: shoulder.x + side * 1.0 * u, y: shoulder.y)
-            let h = NSPoint(x: sh.x + side * cos(a) * 11.0 * u, y: sh.y - sin(a) * 11.0 * u)
-            let sag = (0.5 + 1.7 * abs(cos(a))) * u
-            let elbow = NSPoint(x: (sh.x + h.x) / 2 + side * 0.5 * u * sin(a), y: (sh.y + h.y) / 2 + sag)
-            arms.move(to: sh); arms.curve(to: h, controlPoint1: elbow, controlPoint2: elbow)
+        for g in armPoints(p) {
+            let h = pt(g.h.x, g.h.y), e = pt(g.elbow.x, g.elbow.y)
+            arms.move(to: pt(g.sh.x, g.sh.y)); arms.curve(to: h, controlPoint1: e, controlPoint2: e)
             hands.append(h)
         }
         let star = NSBezierPath()
-        for (i, h) in hands.enumerated() {
+        let targets = pomTargets(p)
+        for i in 0..<2 {
             let dir: CGFloat = i == 0 ? -1 : 1
-            // 花球抛起来时在空中转；跳起来时也跟着转（spin）
-            let arc = 4 * p.toss * (1 - p.toss)                          // 0 → 1 → 0 的抛物线
-            let cx = h.x + dir * 1.0 * arc * u, cy = max(3.6 * u, h.y - 7 * arc * u)      // 抛得再高也留在画面里
+            // 花球跟着手走但慢半拍；位置限制在画面里，抛得再高、甩得再开也不会被裁掉
+            var c = pomPos.count == 2 && behind <= 0.02 ? pomPos[i] : targets[i]
+            // 花球晃的时候也不许压到头上：一压上去，头的轮廓线就被花球盖掉了
+            let hcx = 19 + p.lean * 1.25, hcy = 10.4 + p.hop, clear: CGFloat = 5.4 + 3.7
+            let qx = c.x - hcx, qy = c.y - hcy, qd = max(hypot(qx, qy), 0.001)
+            if qd < clear, behind <= 0.02, p.toss <= 0.001, !(i == 1 && curious > 0.3) { c = NSPoint(x: hcx + qx / qd * clear, y: hcy + qy / qd * clear) }
+            let lagX = c.x - targets[i].x, speed = min(1, hypot(pomVel[i].x, pomVel[i].y) / 26)
+            let cx = min(max(c.x, 4.1), 33.9) * u, cy = max(c.y, 4.1) * u
+            // 背手时花球一直是原来的大小跟着手走，到了身后才收起来（而不是一路缩小，那样像东西没握在手里）
+            let hide = min(max((behind - 0.6) / 0.36, 0), 1)
+            let size = 2.8 * u * (1 - hide * hide * (3 - 2 * hide))
             for k in 0..<3 {
-                let a = (CGFloat(k) + (p.toss * 5 + p.spin) * dir) * .pi / 3
-                star.move(to: NSPoint(x: cx - cos(a) * 2.8 * u, y: cy - sin(a) * 2.8 * u))
-                star.line(to: NSPoint(x: cx + cos(a) * 2.8 * u, y: cy + sin(a) * 2.8 * u))
+                // 抛起来时在空中转，跳起来时也跟着转（spin）；被甩的时候顺着歪一点，穗子长短跟着抖
+                let a = (CGFloat(k) + (p.toss * 5 + p.spin) * dir) * .pi / 3 + lagX * 0.2
+                let len = size * (1 + 0.13 * speed * sin(flutter + CGFloat(k) * 2.1 + CGFloat(i) * 1.3))
+                star.move(to: NSPoint(x: cx - cos(a) * len, y: cy - sin(a) * len))
+                star.line(to: NSPoint(x: cx + cos(a) * len, y: cy + sin(a) * len))
             }
         }
 
@@ -1736,8 +2048,23 @@ final class BoardView: NSView, NSTextFieldDelegate {
             }
         }
 
+        // 「嗯？」的问号：从头的右上角冒出来，线条和睡觉的 z 是同一种（细线加一圈淡淡的深色）
+        if curious > 0.05, behind < 0.01 {
+            let k = curious * curious * (3 - 2 * curious)
+            let qx = (19 + p.lean * 1.25 + 7.6) * u, qy = (10.4 + p.hop - 5.6 - 0.6 * k) * u, q = 1.25 * u * (0.6 + 0.4 * k)
+            let mark = NSBezierPath()
+            mark.move(to: NSPoint(x: qx - q, y: qy - q * 0.9))
+            mark.curve(to: NSPoint(x: qx + q, y: qy - q * 0.9), controlPoint1: NSPoint(x: qx - q, y: qy - q * 2.3), controlPoint2: NSPoint(x: qx + q, y: qy - q * 2.3))
+            mark.curve(to: NSPoint(x: qx, y: qy + q * 0.7), controlPoint1: NSPoint(x: qx + q, y: qy - q * 0.1), controlPoint2: NSPoint(x: qx, y: qy - q * 0.1))
+            let dot = NSBezierPath(ovalIn: NSRect(x: qx - 0.34 * u, y: qy + q * 1.5, width: 0.68 * u, height: 0.68 * u))
+            mark.lineCapStyle = .round; mark.lineJoinStyle = .round
+            mark.lineWidth = 1.9 * sw; halo.withAlphaComponent(0.45 * k).setStroke(); mark.stroke()
+            mark.lineWidth = 0.95 * sw; ink.withAlphaComponent(k).setStroke(); mark.stroke()
+            ink.withAlphaComponent(k).setFill(); dot.fill()
+        }
+
         // 脑袋：实心圆，五官用深色刻在上面
-        let hc = NSPoint(x: (19 + p.lean * 1.25) * u, y: (10.4 + p.hop) * u), hr = 5.4 * u
+        let hc = NSPoint(x: (19 + p.lean * 1.25 + headOff.x) * u, y: (10.4 + p.hop + headOff.y) * u), hr = 5.4 * u
         let head = NSBezierPath(ovalIn: NSRect(x: hc.x - hr, y: hc.y - hr, width: hr * 2, height: hr * 2))
         head.lineWidth = 1.5 * sw; halo.setStroke(); head.stroke()
         ink.setFill(); head.fill()
@@ -1779,8 +2106,10 @@ final class BoardView: NSView, NSTextFieldDelegate {
             o.lineWidth = 0.6 * sw; o.stroke()
         case 4:     // 淡淡一笑：嘴是一小段往右上翘的弧
             halfEye(-ex); halfEye(ex)
-            f.move(to: fp(-0.7, my + 0.25)); f.curve(to: fp(1.4, my - 0.35), controlPoint1: fp(0.0, my + 0.6), controlPoint2: fp(0.9, my + 0.35))
             f.stroke()
+            let smile = NSBezierPath()               // 嘴的形状不变，线比眼睛细一点
+            smile.move(to: fp(-0.7, my + 0.25)); smile.curve(to: fp(1.4, my - 0.35), controlPoint1: fp(0.0, my + 0.6), controlPoint2: fp(0.9, my + 0.35))
+            smile.lineWidth = 0.8 * sw; smile.lineCapStyle = .round; smile.stroke()
         case 0:     // 放松：眼睛闭上，只剩两道眼皮
             lid(-ex); lid(ex); flatMouth(0.6)
             f.stroke()
@@ -1797,9 +2126,16 @@ final class BoardView: NSView, NSTextFieldDelegate {
         // 最上面两层：手臂，然后花球
         stroke(arms, 2.2, ink)
         let patch = NSBezierPath()                 // 手臂的描边会在肩膀处横切过躯干，用一小段躯干本体盖回去
-        patch.move(to: pt(19 + p.lean, 16.6 + p.hop)); patch.line(to: pt(19 + p.lean * 0.6, 19.4 + p.hop))
+        let neckT = 1.9 / max(hipY - 14.4 - p.hop, 0.1)
+        patch.move(to: pt(19 + p.lean * (1 - neckT), 16.3 + p.hop)); patch.line(to: pt(19, hipY))       // 盖整段躯干：只盖肩膀那一小截的话，剩下的描边会在身体里留下尖尖的线头
         patch.lineWidth = 2.2 * sw; patch.lineCapStyle = .round; ink.setStroke(); patch.stroke()
-        stroke(star, 2.0, accent)
+        if behind > 0.5 {                                    // 手背到身后：躯干和腿重新盖在手臂上面（只盖肩膀以下，别压到脸）
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: NSRect(x: 0, y: (17.2 + p.hop) * u, width: bounds.width, height: bounds.height)).addClip()
+            stroke(body, 2.2, ink)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        if behind < 0.95 { stroke(star, 2.0, accent) }
     }
 
     /// 收起后的笑脸：嘴是一条往右上翘的线，末端带箭头，像一根上涨的走势
@@ -1906,6 +2242,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
     override func mouseExited(with event: NSEvent) { updateHover(nil); onHover?(false) }
     override func rightMouseDown(with event: NSEvent) {
         if page != .list { onBack?(); return }
+        if !mini, let t = tabAt(convert(event.locationInWindow, from: nil)) { onTabMenu?(t); return }
         onContextMenu?(mini ? nil : rowAt(convert(event.locationInWindow, from: nil)))
     }
 }
@@ -1963,6 +2300,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     var panel: NSPanel!
     var board = BoardView()
+    var folding = false              // 面板正在收成拉拉队脚下的横线
+    let bubble = BubbleView()        // 对着拉拉队右键冒出来的气泡
+    var bubbleOpen = false
+    var bubbleLeftAt = 0.0           // 气泡开着时鼠标是什么时候离开的（0 = 还在上面）
+    var bubbleHoverAt = 0.0          // 鼠标是什么时候停到拉拉队身上的（0 = 不在）
+    var bubbleMuted = false          // 刚点过气泡里的选项：鼠标离开之前先别再冒出来
+    var bubbleShrinkPending = false  // 按下时气泡已经藏了，但窗口等松手后再缩回去（拖动途中改窗口大小会让它跳一下）
+    // ───────── 拉拉队的状态：谁说了算，按什么顺序 ─────────
+    // 输入有四个：
+    //   1. 作息：设置里「拉拉队作息」跟哪个市场（或永不休息），加上那个市场现在开没开盘 → marketLive
+    //   2. 手动：用户在气泡里点了「休息」或「加油」 → manual（nil = 没点过，按作息来）
+    //   3. 鼠标：在它身边（展开时也包括面板上）→ near；气泡开着也算
+    //   4. 换花球：正在换 → swapStart > 0
+    // 先得出「它该是哪种模式」：mode = manual ?? marketLive（true 加油，false 休息）
+    // 再得出「它现在在干什么」，上面的压过下面的：
+    //   换花球中 → 站定换花球
+    //   鼠标在身边 / 气泡开着 → 醒着歇着，看着鼠标（或气泡）
+    //   模式是加油 → 跳整套动作
+    //   模式是休息 → 先犯困，再睡着
+    // 气泡里第一项永远写的是「换成另一种模式」：模式是加油就显示「休息」，是休息就显示「加油」。和鼠标在不在身边无关。
+    // manual 什么时候自动清掉（回到按作息来）：
+    //   · 跟的那个市场开盘或收盘了
+    //   · 用户在设置里改了「拉拉队作息」
+    //   · 手动选的和作息本来的结果一样（比如休市时点了「休息」）
+    //   切换市场标签不清：用户说了歇着，换个标签看看不该把它吵醒。
+    var manual: Bool?
+    var modeCheer: Bool { manual ?? marketLive }
+    var resting0: Bool { !modeCheer }               // 不看鼠标的话，它现在该不该歇着
+    var scheduleKey = ""                            // 上次算 marketLive 时跟的是哪个市场、用的哪个作息设置
+    /// 重新算一遍作息，并按上面的规则清 manual。每 5 秒一次；改了设置、换了标签、点了气泡之后立刻再算一次
+    func refreshMode() {
+        let which = cfg.restSchedule == "auto" ? tab : cfg.restSchedule
+        let mk: Market = which == "us" ? .us : (which == "hk" ? .hk : .aStock)
+        let live = which == "never" || mk.status(stamp: nil).live || ProcessInfo.processInfo.environment["PEEK_FORCE_LIVE"] != nil
+        let key = cfg.restSchedule + "|" + which
+        let sameMarket = key == scheduleKey
+        let settingChanged = !scheduleKey.isEmpty && !scheduleKey.hasPrefix(cfg.restSchedule + "|")
+        if settingChanged { manual = nil }                              // 改了作息设置
+        else if sameMarket, live != marketLive { manual = nil }         // 同一个市场开盘 / 收盘了
+        scheduleKey = key
+        marketLive = live
+        if manual == live { manual = nil }                              // 手动的和作息一样，就不用记了
+        syncBubble()
+    }
+    /// 气泡开着时，里面的字跟着当前模式走
+    func syncBubble() {
+        guard bubbleOpen else { return }
+        let first = modeCheer ? ("rest", T("休息", "Rest")) : ("cheer", T("加油", "Cheer"))
+        let want = [first, ("quit", T("退出", "Quit"))]
+        if bubble.items.map({ $0.icon + $0.text }) != want.map({ $0.0 + $0.1 }) { bubble.items = want }
+    }
+    var bubbleTuck: CGFloat { floor(mascotSide * 0.22) }           // 气泡的尖角伸进拉拉队那一块多少：脑袋左边本来是空的，贴近一点才像它说的话
+    var bubbleWidth: CGFloat { bubbleOpen ? max(0, bubble.fittingSize().width + 3 - bubbleTuck) : 0 }
+
+    func openBubble() {
+        // 气泡是拉拉队说的话，大小跟着它走：界面放大时气泡也放大，但不超过拉拉队撑得起的程度（小号拉拉队配特大界面时气泡会比它还高、压到面板上）
+        bubble.theme = cfg.theme; bubble.fontSize = CGFloat(cfg.fontSize) * min(uiScale, max(1, mascotSide / 68))
+        bubbleOpen = true; bubbleLeftAt = 0
+        bubble.items = []; refreshMode()                           // 打开前先按最新的状态算一遍，里面的字才对
+        let sz = bubble.fittingSize(), u = mascotSide / 38
+        render()                                                   // 收起状态下窗口要先往左伸出一块给气泡
+        let headY = (10.4 + 0.9) * u                               // 脑袋中心的高度
+        let y = min(max(2, headY - sz.height * 0.42), max(2, mascotSide - sz.height - 2))
+        bubble.tailY = headY - y
+        bubble.autoresizingMask = [.minXMargin]                    // 钉在拉拉队左边，窗口变宽变窄都跟着右边走
+        bubble.frame = NSRect(x: stage.bounds.width - mascotSide + bubbleTuck - sz.width, y: y, width: sz.width, height: sz.height)
+        bubble.hover = nil; bubble.isHidden = false; bubble.needsDisplay = true
+        mascot.needsDisplay = true
+    }
+    func closeBubble() {
+        guard bubbleOpen else { return }
+        bubbleOpen = false; bubble.isHidden = true
+        render()
+    }
+    let debugClose = ProcessInfo.processInfo.environment["PEEK_CLOSEBTN"] != nil      // 调试用：一直显示头边的小叉
+    let debugFold = ProcessInfo.processInfo.environment["PEEK_FOLD"].flatMap { Double($0) }   // 调试用：收起的过渡停在这个进度
+    var swapStart = 0.0              // 正在背手换花球：从什么时候开始的（0 = 没在换）
+    var swapFrom: Pose?              // 开始换的那一刻它是什么姿势
+    var mascot = BoardView()         // 只用来画拉拉队：收起时是它，展开时它站在面板上沿
+    let stage = StageView()
+    var cheerStyle: Bool { cfg.miniStyle != "face" }
+    var uiScale: CGFloat { ["s": 0.9, "l": 1.2, "xl": 1.4][cfg.uiSize] ?? 1 }
+    var mascotSide: CGFloat { ["s": 68, "l": 112][cfg.mascotSize] ?? 88 }
+    var stageTop: CGFloat { cheerStyle ? floor(mascotSide * 33.0 / 38) : 0 }
+    /// 拉拉队那一块在屏幕上的位置：始终是窗口的右上角
+    var mascotScreenRect: NSRect { let f = panel.frame, m = mascotSide; return NSRect(x: f.maxX - m, y: f.maxY - m, width: m, height: m) }
+    /// 鼠标是不是在看得见的东西上（面板或拉拉队）；窗口左上那块透明的空白不算
+    func mouseInside() -> Bool {
+        let m = NSEvent.mouseLocation, f = panel.frame
+        guard cheerStyle else { return f.contains(m) }
+        if mascotScreenRect.contains(m) { return true }
+        if bubbleOpen, let w = bubble.window, w.convertToScreen(bubble.convert(bubble.bounds, to: nil)).contains(m) { return true }
+        return !mini && NSRect(x: f.minX, y: f.minY, width: f.width, height: max(0, f.height - stageTop)).contains(m)
+    }
     var cfg = Config()
     var configBad = false            // 配置文件格式有误（此时沿用上一份可用配置）
     var configMTime: Date?
@@ -1997,11 +2428,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     var statusItem: NSStatusItem?
     var hotKeyRef: EventHotKeyRef?
+    var hotKeyHandlerInstalled = false
+    var bubbleKeyRef: EventHotKeyRef?       // 气泡开着时临时登记的那个字母键
+    var bubbleKeyCode: UInt32?
     var hotKeyOK = true
     var lastHits: [SearchHit] = []   // 「添加」页当前的搜索结果
     var adding = false               // 正在确认某只能不能加（防止连点加两次）
     var borrowedFrom: NSRunningApplication?      // 为了接捏合手势临时切到前台时，原来在前台的是谁
     var lastNearAt = 0.0             // 鼠标最后一次在拉拉队旁边是什么时候
+    var gazeHeld = NSPoint.zero            // 鼠标离开那一刻眼睛看着的方向
     var searchSeq = 0
     var searchTimer: Timer?
     var guideStep = 0
@@ -2055,7 +2490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     static var tabNames: [String: String] { ["a": T("A股", "CN"), "hk": T("港股", "HK"), "us": T("美股", "US")] }
     /// 有股票的市场才有标签页
-    var tabIDs: [String] { ["a", "hk", "us"].filter { id in allStocks.contains { AppDelegate.tabOf($0) == id } } }
+    var tabIDs: [String] { cfg.tabOrder.filter { id in allStocks.contains { AppDelegate.tabOf($0) == id } } }
     var tab = "a" { didSet { if tab != oldValue { store.set(tab, forKey: "tab") } } }
     /// 当前这一页显示的股票
     var shown: [String] {
@@ -2079,10 +2514,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
         panel.allowsToolTipsWhenApplicationIsInactive = true
-        panel.contentView = board
-
-        board.onHover = { [weak self] inside in
+        stage.mascot = mascot; stage.board = board
+        stage.addSubview(mascot); stage.addSubview(board)        // 面板在上层：两块重叠的那一条归面板
+        panel.contentView = stage
+        mascot.mini = true
+        mascot.onToggleMini = { [weak self] in self?.toggleMini() }
+        bubble.isHidden = true
+        stage.addSubview(bubble)
+        bubble.onPick = { [weak self] i in
             guard let self = self else { return }
+            if i == 1 { NSApp.terminate(nil); return }
+            self.bubbleMuted = true
+            self.manual = !self.modeCheer            // 换成另一种模式
+            self.refreshMode()
+            self.lastNearAt = 0                      // 让它歇着时不用再等鼠标走开那几秒
+            self.closeBubble()
+        }
+        mascot.onHover = { [weak self] inside in self?.board.onHover?(inside) }
+
+        board.onHover = { [weak self] raw in
+            guard let self = self else { return }
+            let inside = raw || self.mouseInside()      // 从面板挪到拉拉队身上不算离开
             self.hovering = inside
             self.applyConfig()
             self.render()
@@ -2118,6 +2570,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     else { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
                 } else {
                     self.edit { $0.removeAll { $0 == raw }; $0.insert(raw, at: 0) }
+                }
+            }
+        }
+        board.onReorderTab = { [weak self] from, to in
+            guard let self = self else { return }
+            var ids = self.tabIDs
+            guard from < ids.count, to < ids.count, from != to else { return }
+            ids.insert(ids.remove(at: from), at: to)
+            let order = ids + self.cfg.tabOrder.filter { !ids.contains($0) }        // 现在没有股票的市场排在后面
+            if !self.mutateConfigObject({ $0["tabOrder"] = order }) { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+        }
+        board.onTabMenu = { [weak self] i in
+            guard let self = self, i < self.tabIDs.count, self.tabIDs.count > 1 else { return }
+            let id = self.tabIDs[i], name = AppDelegate.tabNames[id] ?? id
+            let n = self.allStocks.filter { AppDelegate.tabOf($0) == id }.count
+            let at = self.board.convert(self.panel.mouseLocationOutsideOfEventStream, from: nil), anchor = NSPoint(x: at.x, y: at.y + 2)
+            self.board.dropSel = -1
+            self.board.dropdown = BoardView.Dropdown(row: 0, options: [T("移除\(name)", "Remove \(name)")], current: -1, anchor: anchor) { _ in
+                // 这一页的股票会一起移除，所以再确认一次
+                DispatchQueue.main.async {
+                    self.board.dropSel = -1
+                    self.board.dropdown = BoardView.Dropdown(row: 0, options: [T("确认移除 \(n) 只", "Remove \(n) stocks"), T("取消", "Cancel")], current: -1, anchor: anchor) { k in
+                        guard k == 0 else { return }
+                        if self.selected.map({ AppDelegate.tabOf($0) == id }) == true { self.selected = nil }
+                        if self.mutateConfig({ $0.removeAll { AppDelegate.tabOf($0) == id } }) { self.flash(T("已移除\(name)", "Removed \(name)")) }
+                        else { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+                    }
                 }
             }
         }
@@ -2166,7 +2645,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         board.onSelectTab = { [weak self] i in
             guard let self = self, i < self.tabIDs.count else { return }
+            // 花球跟随市场时，换到涨色不同的市场才背手换一副（A 股和港股都是红的，不用换）
+            let goGreen = self.tabIDs[i] == "us" ? self.cfg.usGreenUp : self.cfg.upColor == "green"
+            if self.tab != self.tabIDs[i], goGreen != self.mascot.greenUp, self.cfg.color, self.cfg.pomColor == "auto", self.cheerTimer != nil, !self.mini, !self.mascot.isHidden {
+                let now = CACurrentMediaTime(), x = (now - self.swapStart) / swapSeconds
+                if self.swapStart == 0 { self.swapStart = now }
+                else if x > swapIn, x < swapOut { self.swapStart = now - swapIn * swapSeconds }      // 手已经在身后：接着再掏一次，不用先拿出来
+                else if x >= swapOut, x < 1 {           // 正在往外拿：从同样的位置把手收回去，再换一次（不然只会看到颜色变了）
+                    self.swapStart = now - swapIn * (1 - (x - swapOut) / (1 - swapOut)) * swapSeconds
+                    self.swapFrom = Pose()              // 这时它已经站定了，收手就从站定的姿势收
+                }
+            }
             self.tab = self.tabIDs[i]
+            self.refreshMode()
             self.selected = nil
             self.board.detail = nil; self.closing = false      // 换页时详情直接关掉，不播收起动画
             self.render()
@@ -2226,10 +2717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyConfig()
         render()
         panel.orderFrontRegardless()
-        if let v = ProcessInfo.processInfo.environment["PEEK_CHEER_T"].flatMap({ Double($0) }) { board.pose = v < 0 ? Pose.resting(at: -v, asleep: true) : cheerPose(at: v) }   // 调试用：定在这套动作的第几秒（负数 = 休息姿势）
+        if let v = ProcessInfo.processInfo.environment["PEEK_CHEER_T"].flatMap({ Double($0) }) { mascot.pose = v < 0 ? Pose.resting(at: -v, asleep: true) : cheerPose(at: v) }   // 调试用：定在这套动作的第几秒（负数 = 休息姿势）
         else { updateCheer() }
         if let g = ProcessInfo.processInfo.environment["PEEK_GAZE"]?.split(separator: ",").compactMap({ Double($0) }), g.count == 2 {
-            board.gaze = NSPoint(x: g[0], y: g[1]); board.facing = true; board.pose = Pose.resting(at: 0.8, asleep: false)
+            mascot.gaze = NSPoint(x: g[0], y: g[1]); mascot.facing = true; mascot.pose = Pose.resting(at: 0.8, asleep: false)
         }
         // 捏合手势：系统只发给前台应用的窗口。小窗不在前台时从这里接
         NSEvent.addGlobalMonitorForEvents(matching: [.magnify, .scrollWheel]) { [weak self] e in
@@ -2292,6 +2783,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let h = ProcessInfo.processInfo.environment["PEEK_HOVER"].flatMap({ Int($0) }) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in self?.board.debugHover(row: h) }
         }
+        // 调试用：PEEK_TABMOVE=0,2 启动 3 秒后把第 1 个市场标签拖到第 3 个；PEEK_TABMENU=1 在第 2 个标签上开右键菜单，PEEK_TABMENU=1,go 一路点到确认
+        if let v = ProcessInfo.processInfo.environment["PEEK_TABMOVE"]?.split(separator: ",").compactMap({ Int($0) }), v.count == 2 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                self.board.onReorderTab?(v[0], v[1])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { print("tabs=\(self.tabIDs) order=\(self.cfg.tabOrder)"); fflush(stdout) }
+            }
+        }
+        if let v = ProcessInfo.processInfo.environment["PEEK_TABMENU"]?.split(separator: ","), let i = v.first.flatMap({ Int($0) }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                self.board.onTabMenu?(i)
+                guard v.count > 1 else { return }
+                self.board.dropdown?.pick(0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    let d = self.board.dropdown; self.board.dropdown = nil; d?.pick(0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { print("tabs=\(self.tabIDs) stocks=\(self.cfg.stocks.count) tab=\(self.tab) shown=\(self.shown.count) boardTabs=\(self.board.tabs.count) selected=\(String(describing: self.selected))"); fflush(stdout) }
+                }
+            }
+        }
+        // 调试用：PEEK_POM=green 启动 3 秒后把花球配色改成这个，并打印换的过程
+        if let v = ProcessInfo.processInfo.environment["PEEK_POM"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                _ = self.mutateConfigObject { $0["pomColor"] = v }
+                for d in [0.05, 0.6, 1.0, 1.8] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + d) {
+                        print("cfg=\(self.cfg.pomColor) shown=\(self.mascot.cfg.pomColor) swapping=\(self.swapStart > 0) behind=\(String(format: "%.2f", Double(self.mascot.behind)))"); fflush(stdout)
+                    }
+                }
+            }
+        }
+        // 调试用：PEEK_FSM=1 启动 3 秒后把作息状态机的几条规则走一遍并打印
+        if ProcessInfo.processInfo.environment["PEEK_FSM"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                func show(_ t: String) { print("\(t): schedule=\(self.cfg.restSchedule) tab=\(self.tab) live=\(self.marketLive) manual=\(String(describing: self.manual)) modeCheer=\(self.modeCheer)") }
+                self.refreshMode(); show("1 起始")
+                self.manual = !self.modeCheer; self.refreshMode(); show("2 手动切换")
+                let before = self.manual
+                self.board.onSelectTab?(1); show("3 换标签后（手动应保留=\(String(describing: before))）")
+                _ = self.mutateConfigObject { $0["restSchedule"] = "never" }; self.refreshMode(); show("4 作息改成永不休息（手动应清掉）")
+                self.manual = false; self.refreshMode(); show("5 永不休息时手动休息")
+                _ = self.mutateConfigObject { $0["restSchedule"] = "auto" }; self.refreshMode(); show("6 作息改回跟随（手动应清掉）")
+                self.manual = self.marketLive; self.refreshMode(); show("7 手动和作息一样（应清掉）")
+                fflush(stdout)
+            }
+        }
+        // 调试用：PEEK_BUBBLE=1 启动 3 秒后打开拉拉队的右键气泡；PEEK_BUBBLE=pick 再点第一项并打印状态
+        if let v = ProcessInfo.processInfo.environment["PEEK_BUBBLE"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                self.openBubble(); self.bubble.hover = 0
+                if v == "click" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        let inView = NSPoint(x: 20, y: 5 + 8)                       // 第一项里的一个点
+                        let w = self.bubble.convert(inView, to: nil)
+                        func ev(_ t: NSEvent.EventType) -> NSEvent { NSEvent.mouseEvent(with: t, location: w, modifierFlags: [], timestamp: 0, windowNumber: self.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)! }
+                        print("hit=\(String(describing: self.stage.hitTest(self.stage.superview?.convert(w, from: nil) ?? w).map { type(of: $0) })) before modeCheer=\(self.modeCheer)")
+                        self.bubble.mouseDown(with: ev(.leftMouseDown)); print("pressed=\(String(describing: self.bubble.pressed))")
+                        self.bubble.mouseUp(with: ev(.leftMouseUp))
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { print("after modeCheer=\(self.modeCheer) manual=\(String(describing: self.manual)) bubbleOpen=\(self.bubbleOpen)"); fflush(stdout) }
+                    }
+                    return
+                }
+                if v == "key" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        let fr = self.panel.firstResponder
+                        print("key=\(self.panel.isKeyWindow) firstResponder=\(String(describing: fr.map { type(of: $0) })) before modeCheer=\(self.modeCheer)")
+                        let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: self.panel.windowNumber, context: nil, characters: "r", charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15)!
+                        (fr ?? self.board).keyDown(with: e)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { print("after modeCheer=\(self.modeCheer) bubbleOpen=\(self.bubbleOpen)"); fflush(stdout) }
+                    }
+                    return
+                }
+                guard v == "pick" else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    print("before manual=\(String(describing: self.manual)) resting0=\(self.resting0)")
+                    self.bubble.onPick?(0)
+                    print("after  manual=\(String(describing: self.manual)) resting0=\(self.resting0) bubbleOpen=\(self.bubbleOpen)"); fflush(stdout)
+                }
+            }
+        }
+        // 调试用：PEEK_TOGGLE=1 启动 3 秒后自动收起（或展开）一次
+        if ProcessInfo.processInfo.environment["PEEK_TOGGLE"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                self.toggleMini()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    print("mini=\(self.mini) folding=\(self.folding) fold=\(String(describing: self.board.fold)) boardHidden=\(self.board.isHidden) onBoard=\(self.mascot.onBoard) frame=\(self.panel.frame.size)"); fflush(stdout)
+                }
+            }
+        }
+        // 调试用：PEEK_TAB=2 启动 3 秒后自动切到第 3 个市场页
+        if let s = ProcessInfo.processInfo.environment["PEEK_TAB"], let i = Int(s) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+                self.board.onSelectTab?(i)
+                for d in [0.0, 0.4, 0.7, 1.4] {       // 打印换花球的过程，方便不看屏幕也能核对
+                    DispatchQueue.main.asyncAfter(deadline: .now() + d) {
+                        print("tab=\(self.tab) swapping=\(self.swapStart > 0) behind=\(String(format: "%.2f", Double(self.mascot.behind))) pomGreen=\(self.mascot.greenUp) frame=\(self.panel.frame.size) mascotHidden=\(self.mascot.isHidden) boardHidden=\(self.board.isHidden)")
+                        fflush(stdout)
+                    }
+                }
+            }
+        }
         // 调试用：PEEK_SELECT=2 启动后自动展开第 3 行
         if let s = ProcessInfo.processInfo.environment["PEEK_SELECT"], let i = Int(s) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.board.onClickRow?(i) }
@@ -2300,9 +2897,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applyConfig() {
         board.cfg = cfg
+        // 在设置里换了花球配色：也背手换一副，新颜色等手在身后时才换上
+        var mc = cfg
+        if mascot.cfg.pomColor != cfg.pomColor {
+            let now = CACurrentMediaTime()
+            if swapStart == 0, cheerTimer != nil, !mascot.isHidden, panel.isVisible { swapStart = now }
+            if swapStart > 0, !swapState(min((now - swapStart) / swapSeconds, 1)).found { mc.pomColor = mascot.cfg.pomColor }
+        }
+        mascot.cfg = mc
         UI.theme = cfg.theme; UI.fontSize = CGFloat(cfg.fontSize); UI.color = cfg.color
         lang = cfg.language.isEmpty ? systemLang() : cfg.language
-        // 鼠标停在小窗上时允许被截图（方便自己截），移开后截图和屏幕共享里都看不到
+        // 默认截图和屏幕共享里都能看到；配置里打开 hideFromScreenShare 后只有鼠标停在上面时才看得到
         panel.sharingType = (cfg.hideFromScreenShare && !hovering) ? .none : .readOnly
         // 快捷键没注册上时必须留着菜单栏小圆点，不然隐藏后就叫不回来了
         let wantIcon = cfg.menuBarIcon || !hotKeyOK
@@ -2412,7 +3017,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }))
         }
-        // 第一组：收起后的拉拉队
+        // 第一组：界面本身（大小、语言）——最常改、影响也最大的放最前面
+        setting("ui", T("界面大小", "Interface size"), current: cfg.uiSize,
+                options: [("s", T("小", "Small")), ("m", T("中", "Medium")), ("l", T("大", "Large")), ("xl", T("特大", "Extra large"))]) { [weak self] v in
+            _ = self?.mutateConfigObject { $0["uiSize"] = v }
+        }
+        setting("lang", T("语言", "Language"), current: lang, options: [("zh", "中文"), ("en", "English")]) { [weak self] v in
+            _ = self?.mutateConfigObject { $0["language"] = v }
+        }
+        rows.append(PRow(sep: true))
+        // 第二组：拉拉队（大小、花球、作息）
         if cfg.miniStyle != "face" {
             setting("size", T("拉拉队大小", "Cheerleader size"), current: cfg.mascotSize,
                     options: [("s", T("小", "Small")), ("m", T("中", "Medium")), ("l", T("大", "Large"))]) { [weak self] v in
@@ -2428,17 +3042,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     options: [("auto", T("跟随当前市场", "This market")), ("a", T("跟随 A 股", "China")), ("hk", T("跟随港股", "Hong Kong")),
                               ("us", T("跟随美股", "US")), ("never", T("永不休息", "Never rests"))]) { [weak self] v in
                 _ = self?.mutateConfigObject { $0["restSchedule"] = v }
-                self?.marketCheckedAt = 0
+                self?.refreshMode()
             }
             rows.append(PRow(sep: true))
         }
-        // 第二组：程序本身
-        setting("lang", T("语言", "Language"), current: lang, options: [("zh", "中文"), ("en", "English")]) { [weak self] v in
-            _ = self?.mutateConfigObject { $0["language"] = v }
-        }
+        // 第三组：程序（登录时打开、恢复默认、退出）
         setting("login", T("登录时打开", "Open at login"), current: loginItemOn ? "on" : "off",
                 options: [("on", T("开", "On")), ("off", T("关", "Off"))]) { [weak self] _ in self?.toggleLoginItem() }
-        rows.append(PRow(sep: true))
         // 恢复默认设置：和别的操作一样是列表里的一行。要点两次才生效，免得误触
         let confirming = confirmReset
         let resetAction: () -> Void = { [weak self] in
@@ -2775,13 +3385,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 收起并且看得见的时候才播动作；展开、隐藏时停掉节拍，不白耗电
     func updateCheer() {
-        let run = mini && panel.isVisible && cfg.miniStyle != "face" && ProcessInfo.processInfo.environment["PEEK_CHEER_T"] == nil
-        if !run { cheerTimer?.invalidate(); cheerTimer = nil; return }
+        defer { syncBubbleKey() }
+        let run = panel.isVisible && cheerStyle && ProcessInfo.processInfo.environment["PEEK_CHEER_T"] == nil
+        if !run {
+            if bubbleOpen { bubbleOpen = false; bubble.isHidden = true }       // 小窗藏起来时气泡也跟着收，不然再叫出来时它还开着
+            cheerTimer?.invalidate(); cheerTimer = nil; return
+        }
         guard cheerTimer == nil else { return }
         cheerStart = CACurrentMediaTime() + 0.25           // 等小窗缩完再开始
         cheerBlendFrom = nil
         cheerResting = false; marketCheckedAt = 0
-        board.pose = cheerRoutine[0].pose
+        mascot.pose = cheerRoutine[0].pose
         let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.cheerTick() }
         RunLoop.main.add(t, forMode: .common)
         cheerTimer = t
@@ -2791,21 +3405,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let now = CACurrentMediaTime()
         if now - marketCheckedAt > 5 {          // 每 5 秒看一眼当前这一页的市场是不是在交易
             marketCheckedAt = now
-            let which = cfg.restSchedule == "auto" ? tab : cfg.restSchedule
-            let mk: Market = which == "us" ? .us : (which == "hk" ? .hk : .aStock)
-            marketLive = which == "never" || mk.status(stamp: nil).live || ProcessInfo.processInfo.environment["PEEK_FORCE_LIVE"] != nil
+            refreshMode()
         }
         // 鼠标在它周围一圈（不必正好压在身上）就算在看它
-        let near = hovering || panel.frame.insetBy(dx: -34, dy: -34).contains(NSEvent.mouseLocation)
+        // 展开时，鼠标在面板上也算在看它：它会停下来，眼睛跟着鼠标在面板上走
+        let mr = mascotScreenRect
+        var near = mr.insetBy(dx: -34, dy: -34).contains(NSEvent.mouseLocation) || (!mini && mouseInside())
         if near { lastNearAt = now }
+        // 鼠标在拉拉队身上停一小会儿，它旁边就冒出气泡；鼠标离开它和气泡一会儿，气泡自己收起来
+        let onMascot = mascotScreenRect.contains(NSEvent.mouseLocation)
+        if !onMascot { bubbleHoverAt = 0; bubbleMuted = false }
+        else if bubbleHoverAt == 0 { bubbleHoverAt = now }
+        // 按着鼠标（点它、拖它）的时候不出气泡；已经出来的马上藏掉，窗口等松手再缩
+        let pressing = NSEvent.pressedMouseButtons & 1 != 0
+        let onBubble = bubbleOpen && (bubble.window?.convertToScreen(bubble.convert(bubble.bounds, to: nil)).contains(NSEvent.mouseLocation) ?? false)
+        if pressing, !onBubble, onMascot || bubbleOpen {
+            bubbleMuted = true
+            if bubbleOpen { bubbleOpen = false; bubble.isHidden = true; bubbleShrinkPending = true }
+        }
+        if !pressing, bubbleShrinkPending { bubbleShrinkPending = false; render() }
+        if onMascot, !pressing, !bubbleOpen, !bubbleMuted, !bubbleShrinkPending, !folding, animTimer == nil { openBubble() }
+        if bubbleOpen {
+            if onMascot || mouseInside() { bubbleLeftAt = 0 }
+            else if bubbleLeftAt == 0 { bubbleLeftAt = now }
+            else if now - bubbleLeftAt > 0.1, ProcessInfo.processInfo.environment["PEEK_BUBBLE"] == nil { closeBubble() }      // 调试时不自动收
+        }
+        if bubbleOpen {                                        // 气泡开着时它醒着、停下来；鼠标指着哪一项，哪一项亮
+            near = true; lastNearAt = now
+            if ProcessInfo.processInfo.environment["PEEK_BUBBLE"] == nil { bubble.hover = bubble.row(at: bubble.convert(panel.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)) }
+        }
         // 鼠标走开后不是马上睡：先醒着 1.5 秒，然后 5 秒里眼皮越来越沉，最后才睡着
         let away = now - lastNearAt
         let drowsy = CGFloat(min(max((away - 1.5) / 5.0, 0), 1))
-        let asleep = !marketLive && !near && drowsy >= 1
-        let resting = near || !marketLive          // 鼠标在旁边，或者市场没在交易（午休、收盘、周末）：歇着
+        let off = resting0
+        let asleep = off && !near && drowsy >= 1
+        let resting = near || off          // 鼠标在旁边，或者市场没在交易（午休、收盘、周末）：歇着
         if resting != cheerResting {
             cheerResting = resting
-            cheerBlendFrom = board.pose; cheerBlendStart = now
+            cheerBlendFrom = mascot.pose; cheerBlendStart = now
             if !resting { cheerStart = now + 0.3 }      // 重新开始时从头跳
         }
         // 休息时一秒只算 12 个画面：动作本来就慢，没必要按 30 帧重画（它可能一歇就是一整晚）
@@ -2813,7 +3450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var target = resting ? Pose.resting(at: rt, asleep: asleep) : cheerPose(at: max(0, now - cheerStart))
         var sleepyBlink = false
         var zFade: CGFloat = 1
-        if resting, !near, !marketLive, drowsy > 0 {
+        if resting, !near, off, drowsy > 0 {
             // 犯困：眨眼越来越慢、闭着的时间越来越长，头一点一点往下掉。
             // 睡着之后这些不是一下子停：头保持歪着，点头的幅度用 2 秒慢慢收掉，z 用 1.5 秒淡入
             let since = max(0, away - 6.5)                              // 睡着了多久
@@ -2824,29 +3461,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if asleep { zFade = CGFloat(min(1, since / 1.5)) }
             else { sleepyBlink = ph < 0.15 + 0.8 * drowsy }             // 快睡着时几乎一直闭着，接上睡着后的闭眼
         }
-        if zFade != board.zFade { board.zFade = zFade; board.needsDisplay = true }
+        if zFade != mascot.zFade { mascot.zFade = zFade; mascot.needsDisplay = true }
         // 鼠标停在它身上时：醒着，眼睛跟着鼠标走
         var gaze = NSPoint.zero
         if near {
-            let m = board.convert(panel.mouseLocationOutsideOfEventStream, from: nil)
-            let half = max(board.bounds.width, 1) / 2
-            gaze = NSPoint(x: min(max((m.x - half) / half, -1), 1), y: min(max((m.y - board.bounds.height * 0.27) / half, -1), 1))
+            let m = mascot.convert(panel.mouseLocationOutsideOfEventStream, from: nil)
+            let half = max(mascot.bounds.width, 1) / 2
+            // 看的是方向：鼠标离得远（比如在面板最下面）时眼睛也不会顶死在角上不动，左右移动仍然跟得上
+            let dx = m.x - half, dy = m.y - mascot.bounds.height * 0.27, dist = hypot(dx, dy)
+            let amount = min(1, dist / (dist + half * 0.5) * 1.2)
+            if dist > 0.5 { gaze = NSPoint(x: ((dx / dist * amount) * 40).rounded() / 40, y: ((dy / dist * amount) * 40).rounded() / 40) }
+            gazeHeld = gaze
+        } else if away < 2.0 {
+            // 鼠标走开后不马上看回正前方：先朝它离开的方向多看 0.7 秒，再用 1.3 秒慢慢收回来
+            let x = CGFloat(min(max((away - 0.7) / 1.3, 0), 1))
+            let k = 1 - x * x * (3 - 2 * x)
+            gaze = NSPoint(x: ((gazeHeld.x * k) * 50).rounded() / 50, y: ((gazeHeld.y * k) * 50).rounded() / 50)
         }
-        if gaze != board.gaze || near != board.facing { board.gaze = gaze; board.facing = near; board.needsDisplay = true }
+        if bubbleOpen { gaze = NSPoint(x: -0.95, y: -0.35) }        // 抬头看着左边的气泡
+        if pressing, onMascot || mouseInside() { gaze = .zero }     // 被按住、被拖着走的时候目视前方
+        // 眼睛不是一下子转过去的：每帧朝要看的方向挪一截，换目标（看气泡、看鼠标、回正）时都是滑过去的
+        let cur = mascot.gaze
+        var eased = NSPoint(x: cur.x + (gaze.x - cur.x) * 0.22, y: cur.y + (gaze.y - cur.y) * 0.22)
+        if abs(eased.x - gaze.x) < 0.02, abs(eased.y - gaze.y) < 0.02 { eased = gaze }
+        if eased != mascot.gaze || near != mascot.facing { mascot.gaze = eased; mascot.facing = near; mascot.needsDisplay = true }
         if let from = cheerBlendFrom {                      // 进入或离开休息：用 0.3 秒过渡过去，不硬切
             let x = CGFloat(min(1, (now - cheerBlendStart) / 0.3))
             if x >= 1 { cheerBlendFrom = nil } else { target = from.mix(target, x * x * (3 - 2 * x)) }
         }
+        var behind: CGFloat = 0, dig: CGFloat = 0
+        if swapStart > 0 {
+            let x = (now - swapStart) / swapSeconds          // 睡着时也照样换：闭着眼把手背过去摸一副新的
+            let st = swapState(min(x, 1))
+            if st.found || x >= 1, mascot.greenUp != board.greenUp { mascot.greenUp = board.greenUp; mascot.needsDisplay = true }   // 手还在身后时已经换好
+            if st.found || x >= 1, mascot.cfg.pomColor != cfg.pomColor { mascot.cfg.pomColor = cfg.pomColor; mascot.needsDisplay = true }
+            var stand = Pose(); stand.face = 1; stand.z = target.z
+            if swapFrom == nil { swapFrom = mascot.pose }
+            if x >= 1 {
+                // 换完了：不接着刚才跳到一半的地方（那样会突然很快地补一个动作），而是从这套动作的开头接上
+                swapStart = 0; swapFrom = nil
+                // 直接接到「跳起、双手举高」已经做完的那一刻：它前面的过渡是从下蹲收手来的，从那儿接就会把手收回去再伸一次
+                cheerStart = now - (cheerRoutine[0].move + cheerRoutine[0].hold + cheerRoutine[1].move + cheerRoutine[1].hold + cheerRoutine[2].move)
+                cheerBlendFrom = mascot.pose; cheerBlendStart = now
+                target = mascot.pose
+            } else {
+                behind = st.behind; dig = st.dig
+                // 换的时候整个人站定：不抛、不蹦、身子不晃、腿不动，淡定地换；表情不变
+                let keepFace = target.face
+                target = x < swapIn ? (swapFrom ?? stand).mix(stand, behind) : stand        // 收手时从原来的姿势过渡到站定，之后一直站定
+                target.face = !asleep && drowsy == 0 ? 1 : keepFace
+                if !near, !asleep {
+                    let g = NSPoint(x: 0, y: ((behind * (st.found ? 0 : 0.35)) * 20).rounded() / 20)
+                    if g != mascot.gaze { mascot.gaze = g; mascot.needsDisplay = true }
+                }
+            }
+        }
+        syncBubbleKey()
+        if dig != mascot.dig { mascot.dig = dig; mascot.needsDisplay = true }
+        // 鼠标停在它身上（气泡开着）时：歪头、一只手抬到下巴、头边冒个问号；按住拖动、换花球时不摆
+        let wantCurious: CGFloat = (bubbleOpen || (onMascot && !pressing && !bubbleMuted)) && swapStart == 0 ? 1 : 0
+        var cq = mascot.curious + (wantCurious - mascot.curious) * 0.2
+        if abs(cq - wantCurious) < 0.01 { cq = wantCurious }
+        if cq != mascot.curious { mascot.curious = cq; mascot.needsDisplay = true }
+        if cq > 0 {
+            target.lean += 0.9 * cq
+            if cq > 0.5, !asleep { target.face = 2 }                // 嘴微微张成小 o
+        }
+        if behind != mascot.behind { mascot.behind = behind; mascot.needsDisplay = true }
         target.blink = sleepyBlink || ((!resting || near) && now.truncatingRemainder(dividingBy: 2.9) < 0.13)       // 每隔不到三秒眨一下眼
-        if target != board.pose {                           // 定住不动的那些拍子不重画
-            board.pose = target
-            board.needsDisplay = true
+        if target != mascot.pose {                           // 定住不动的那些拍子不重画
+            mascot.pose = target
+            mascot.needsDisplay = true
         }
     }
 
     @objc func toggleMini() {
+        if bubbleOpen { bubbleOpen = false; bubble.isHidden = true }
+        bubbleMuted = true                  // 点它收起、展开之后，鼠标离开前不再冒气泡
         mini.toggle()
         store.set(mini, forKey: "mini")
+        folding = mini && cheerStyle && panel.isVisible && !board.isHidden       // 收起时播一小段：面板缩成脚下的横线
+        if !folding { board.fold = nil }
         if mini { closePage(); selected = nil; board.detail = nil; closing = false }
         if !panel.isVisible { panel.orderFrontRegardless() }
         render()
@@ -2866,15 +3561,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { AppDelegate.shared?.toggle() }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var hk = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+            let id = hk.id
+            DispatchQueue.main.async {
+                if id == 1 { AppDelegate.shared?.toggle() } else { AppDelegate.shared?.bubbleKeyPressed() }
+            }
             return noErr
         }, 1, &spec, nil, nil)
+        hotKeyHandlerInstalled = true
         let st = RegisterEventHotKey(UInt32(kVK_ANSI_S), UInt32(controlKey | optionKey),
                                      EventHotKeyID(signature: OSType(0x5045454B), id: 1),
                                      GetApplicationEventTarget(), 0, &hotKeyRef)
         hotKeyOK = st == noErr
         if !hotKeyOK { applyConfig() }
+    }
+
+    /// 气泡开着时，把当前那一项的字母（休息 R / 加油 C）登记成快捷键；气泡一收就撤掉。
+    /// 用系统的快捷键登记，不抢键盘焦点：别的键照常打进用户正在用的程序里，只有这一个字母被接走
+    func syncBubbleKey() {
+        guard hotKeyHandlerInstalled else { return }
+        let want: UInt32? = bubbleOpen && panel.isVisible ? UInt32(modeCheer ? kVK_ANSI_R : kVK_ANSI_C) : nil
+        guard want != bubbleKeyCode else { return }
+        if let r = bubbleKeyRef { UnregisterEventHotKey(r); bubbleKeyRef = nil }
+        bubbleKeyCode = nil
+        if let code = want, RegisterEventHotKey(code, 0, EventHotKeyID(signature: OSType(0x5045454B), id: 2), GetApplicationEventTarget(), 0, &bubbleKeyRef) == noErr {
+            bubbleKeyCode = code
+        }
+    }
+    func bubbleKeyPressed() {
+        guard bubbleOpen else { return }
+        bubble.pressed = 0                                   // 和点下去一样亮一下再执行
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in self?.bubble.pressed = nil; self?.bubble.onPick?(0) }
     }
 
     func refresh() {
@@ -3031,7 +3750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 窗口变大变小后，鼠标可能已经不在（或已经在）小窗上却没收到进出事件，这里按实际位置校正
     func syncHover() {
         guard panel.isVisible else { return }
-        let inside = panel.frame.contains(NSEvent.mouseLocation)
+        let inside = mouseInside()
         guard inside != hovering else { return }
         hovering = inside
         applyConfig()
@@ -3040,6 +3759,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 把小窗平滑地过渡到目标大小，同时淡入 / 淡出详情区
+    /// 收起的那一小段播完：面板藏起来，脚下换回拉拉队自己的横线
+    func endFold() {
+        guard folding else { return }
+        folding = false
+        board.fold = nil
+        board.isHidden = cheerStyle && mini
+        if mascot.onBoard == mini { mascot.onBoard = !mini }
+        mascot.needsDisplay = true
+    }
+
     func animate(to target: NSRect, detailAlpha: CGFloat, dip: Bool, done: @escaping () -> Void) {
         if target == animTarget, detailAlpha == animAlphaTarget, !dip { return }   // 已经在去往这个状态的路上，或已经到了
         animTarget = target
@@ -3051,13 +3780,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panel.isVisible, from.size != target.size || dip || board.detailAlpha != detailAlpha else {
             resizing = true; panel.setFrame(target, display: true); resizing = false
             board.detailAlpha = detailAlpha
+            endFold()
             done()
             return
         }
         animDone = done
         let fromAlpha: CGFloat = dip ? 0.25 : board.detailAlpha    // 切换股票时让详情轻轻淡入
         let start = CACurrentMediaTime()
-        let duration = 0.16
+        let duration = folding ? 0.2 : (board.isHidden || from.height <= mascotSide + 1 ? 0.2 : 0.16)      // 收起、展开慢一点，看得清它怎么变的
         let t = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             let p = min(1, (CACurrentMediaTime() - start) / duration)
@@ -3070,6 +3800,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 f = NSRect(x: maxX - w, y: maxY - h, width: w, height: h)
             }
             self.board.detailAlpha = mix(fromAlpha, detailAlpha)
+            if self.folding { self.board.fold = e }
+            if self.folding, let stop = self.debugFold, p >= stop { timer.invalidate(); self.animTimer = nil; print("fold stopped at \(p) frame=\(self.panel.frame.size)"); fflush(stdout); return }
             self.resizing = true
             self.panel.setFrame(f, display: true)
             self.resizing = false
@@ -3077,6 +3809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if p >= 1 {
                 timer.invalidate()
                 self.animTimer = nil
+                self.endFold()
                 let d = self.animDone; self.animDone = nil; d?()
                 self.syncHover()
             }
@@ -3171,9 +3904,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         board.expanded = expanded
         board.showMore = detailMore
         board.mini = mini
+        board.isHidden = cheerStyle && mini && !folding
+        board.foldSide = mascotSide
+        if folding, board.fold == nil { board.fold = 0 }
+        mascot.isHidden = !cheerStyle
+        if mascot.greenUp != board.greenUp {
+            // 花球跟着市场变色时，不是直接换颜色：背过手去换一副（cheerTick 里做）
+            if cfg.pomColor == "auto", cfg.color, cheerTimer != nil, !mascot.isHidden { if swapStart == 0 { swapStart = CACurrentMediaTime() } }
+            else { mascot.greenUp = board.greenUp; mascot.needsDisplay = true }
+        }
+        let standing = !mini || folding
+        if mascot.onBoard != standing { mascot.onBoard = standing; mascot.needsDisplay = true }
+        stage.side = mascotSide; stage.top = stageTop; stage.scale = uiScale; board.foldScale = uiScale
         board.status = statusText()
         board.rows = rows
-        let target = place(board.size(withDetail: want))
+        var size = board.size(withDetail: want)
+        if !mini { size = NSSize(width: ceil(size.width * uiScale), height: ceil(size.height * uiScale)) }      // 面板整体大小
+        if cheerStyle && !mini { size.height += stageTop }        // 上面给拉拉队留一块
+        if cheerStyle, bubbleOpen { size.width = max(size.width, mascotSide + bubbleWidth) }      // 收起时窗口往左伸出一块放气泡
+        let target = place(size)
         let switched = want && lastDetailKey != nil && lastDetailKey != selected
         lastDetailKey = want ? selected : nil
         animate(to: target, detailAlpha: want ? 1 : 0, dip: switched) { [weak self] in
@@ -3281,6 +4030,8 @@ func selfTest() -> Int32 {
     check("分页归属", AppDelegate.tabOf("600519") == "a" && AppDelegate.tabOf("sh000001") == "a" && AppDelegate.tabOf("00700") == "hk" && AppDelegate.tabOf("hkHSI") == "hk"
           && AppDelegate.tabOf("AAPL") == "us" && AppDelegate.tabOf("us.IXIC") == "us" && AppDelegate.tabOf("茅台") == "a")
     check("动作首尾相接", cheerPose(at: 0).aL == -50 && cheerPose(at: 0.41) == Pose() && cheerPose(at: cheerRoutineLength - 0.001).aL < -49 && cheerRoutineLength > 5)
+    check("标签顺序", cfg("{}")?.tabOrder == ["a", "hk", "us"] && cfg("{ \"tabOrder\": [\"us\", \"x\", \"us\"] }")?.tabOrder == ["us", "a", "hk"])
+    check("界面大小", cfg("{}")?.uiSize == "m" && cfg("{ \"uiSize\": \"xl\" }")?.uiSize == "xl" && cfg("{ \"uiSize\": \"huge\" }")?.uiSize == "m")
     check("小人大小", cfg("{}")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"huge\" }")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"l\" }")?.mascotSize == "l")
     check("花球颜色", cfg("{}")?.pomColor == "auto" && cfg("{ \"pomColor\": \"pink\" }")?.pomColor == "auto" && cfg("{ \"pomColor\": \"green\" }")?.pomColor == "green")
     check("作息设置", cfg("{}")?.restSchedule == "auto" && cfg("{ \"restSchedule\": \"never\" }")?.restSchedule == "never" && cfg("{ \"restSchedule\": \"x\" }")?.restSchedule == "auto")
@@ -3294,7 +4045,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--film"), i + 3 < CommandLine.a
     // 调试用：不开任何窗口，把拉拉队在一段时间里的每一帧画成一张连环画。./CheerUp --film 起始秒 结束秒 步长 输出.png
     let a = CommandLine.arguments
     let t0 = Double(a[i + 1])!, t1 = Double(a[i + 2])!, dt = Double(a[i + 3])!, path = a[i + 4]
-    let side: CGFloat = 132, n = Int(((t1 - t0) / dt).rounded()) + 1, cols = min(n, 12), rowsN = (n + cols - 1) / cols
+    let side: CGFloat = ProcessInfo.processInfo.environment["PEEK_FILMSIDE"].flatMap { Double($0) }.map { CGFloat($0) } ?? 132      // 想看清线条衔接时调大
+    let n = Int(((t1 - t0) / dt).rounded()) + 1, cols = min(n, 12), rowsN = (n + cols - 1) / cols
     let view = BoardView(frame: NSRect(x: 0, y: 0, width: side, height: side))
     view.mini = true
     let sheet = NSImage(size: NSSize(width: CGFloat(cols) * side, height: CGFloat(rowsN) * side))
@@ -3302,7 +4054,23 @@ if let i = CommandLine.arguments.firstIndex(of: "--film"), i + 3 < CommandLine.a
     for k in 0..<n {
         let r = NSRect(x: CGFloat(k % cols) * side, y: CGFloat(rowsN - 1 - k / cols) * side, width: side, height: side)
         (k / cols % 2 == 0 ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill(); r.fill()      // 一行深底、一行浅底
-        view.pose = cheerPose(at: t0 + dt * Double(k))
+        view.fixedStep = 1.0 / 60
+        if k > 0, ProcessInfo.processInfo.environment["PEEK_BEHIND"] == nil {
+            var tt = t0 + dt * Double(k - 1)
+            while tt < t0 + dt * Double(k) - 1e-6 { tt += 1.0 / 60; view.pose = cheerPose(at: min(tt, t0 + dt * Double(k))) }
+        } else { view.pose = cheerPose(at: t0 + dt * Double(k)) }
+        if ProcessInfo.processInfo.environment["PEEK_CURIOUS"] != nil {      // 调试用：这一条连环画改成演示鼠标停上去时的「嗯？」
+            let c = CGFloat(min(1, Double(k) * dt / 0.5)); var ps = Pose.resting(at: 0.8, asleep: false)
+            ps.lean += 0.9 * c; if c > 0.5 { ps.face = 2 }
+            view.curious = c; view.facing = true; view.gaze = NSPoint(x: -0.95 * c, y: -0.35 * c)
+            for _ in 0..<12 { view.pose = ps }
+        }
+        if ProcessInfo.processInfo.environment["PEEK_BEHIND"] != nil {       // 调试用：这一条连环画改成演示背手换花球
+            let st = swapState(min(Double(k) * dt / swapSeconds, 1))
+            let ps = Pose.resting(at: 0.8, asleep: false)
+            view.behind = st.behind; view.dig = st.dig; view.greenUp = st.found; view.pose = ps
+            view.gaze = NSPoint(x: 0, y: st.behind * (st.found ? 0 : 0.35))
+        }
         let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
         view.cacheDisplay(in: view.bounds, to: rep)
         rep.draw(in: r)
