@@ -652,8 +652,9 @@ final class BubbleView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
     private var font: NSFont { .monospacedDigitSystemFont(ofSize: fontSize, weight: .regular) }
-    private var rowH: CGFloat { ceil(fontSize * 1.85) }
-    private var cap: CGFloat { ceil(fontSize * 1.28) }        // 字母按键帽的边长
+    var maxH: CGFloat = 0                   // 气泡最高能有多高（拉拉队那一块的高度）；放不下三行时把行压紧一点
+    private var rowH: CGFloat { let full = ceil(fontSize * 1.85); return maxH > 0 && !items.isEmpty ? min(full, floor((maxH - 8) / CGFloat(items.count))) : full }
+    private var cap: CGFloat { min(ceil(fontSize * 1.28), rowH - 3) }        // 字母按键帽的边长
     private var ink: NSColor { theme == "light" ? NSColor(white: 0.15, alpha: 1) : NSColor(white: 0.88, alpha: 1) }
     func fittingSize() -> NSSize {
         let w = (items.map { ($0.text as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0)
@@ -692,12 +693,11 @@ final class BubbleView: NSView {
             if on { ink.withAlphaComponent(down ? 0.3 : 0.16).setFill(); NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5).fill() }
             let tint = on ? ink : ink.withAlphaComponent(0.6)
             let box = NSRect(x: r.minX + 5, y: r.midY - cap / 2, width: cap, height: cap)
-            if it.icon == "rest" || it.icon == "cheer" {
-                // 字母画成一个小键帽：一看就知道是可以按的键（休息 R、加油 C）
+            if let letter = ["rest": "R", "cheer": "C", "hide": "H"][it.icon] {
+                // 字母画成一个小键帽：一看就知道是可以按的键（休息 R、加油 C、隐藏 H）
                 let key = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), xRadius: 3.5, yRadius: 3.5)
                 ink.withAlphaComponent(on ? 0.2 : 0.1).setFill(); key.fill()
                 ink.withAlphaComponent(on ? 0.55 : 0.3).setStroke(); key.lineWidth = 1; key.stroke()
-                let letter = it.icon == "rest" ? "R" : "C"
                 let la: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: fontSize * 0.78, weight: .semibold), .foregroundColor: tint]
                 let ls = (letter as NSString).size(withAttributes: la)
                 (letter as NSString).draw(at: NSPoint(x: box.midX - ls.width / 2, y: box.midY - ls.height / 2), withAttributes: la)
@@ -2365,6 +2365,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     //   · 用户在设置里改了「拉拉队作息」
     //   · 手动选的和作息本来的结果一样（比如休市时点了「休息」）
     //   切换市场标签不清：用户说了歇着，换个标签看看不该把它吵醒。
+    //
+    // ───────── 它在不在屏幕上：三个开关，各管各的 ─────────
+    //   小窗显不显示（⌃⌥S、顶部栏图标）  →  panel.isVisible
+    //   面板展开还是收起（点它、收起按钮） →  mini
+    //   展开时它站不站在面板上（设置「拉拉队显示」）→ cfg.mascotOnBoard
+    // 看得见它 = 小窗显示 且（收起着 或 设置是「始终」）。
+    // 气泡里的「隐藏」不是第四个开关，只是上面两个的快捷入口：
+    //   展开着点 → mascotOnBoard = false（设置页里同步变成「仅收起时」）
+    //   收起着点 → 小窗藏起来
     var manual: Bool?
     var modeCheer: Bool { manual ?? marketLive }
     var resting0: Bool { !modeCheer }               // 不看鼠标的话，它现在该不该歇着
@@ -2388,7 +2397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func syncBubble() {
         guard bubbleOpen else { return }
         let first = modeCheer ? ("rest", T("休息", "Rest")) : ("cheer", T("加油", "Cheer"))
-        let want = [first, ("quit", T("退出", "Quit"))]
+        let want = [first, ("hide", T("隐藏", "Hide")), ("quit", T("退出", "Quit"))]
         if bubble.items.map({ $0.icon + $0.text }) != want.map({ $0.0 + $0.1 }) { bubble.items = want }
     }
     var bubbleTuck: CGFloat { floor(mascotSide * 0.22) }           // 气泡的尖角伸进拉拉队那一块多少：脑袋左边本来是空的，贴近一点才像它说的话
@@ -2399,10 +2408,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bubble.theme = cfg.theme; bubble.fontSize = CGFloat(cfg.fontSize) * min(uiScale, max(1, mascotSide / 68))
         bubbleOpen = true; bubbleLeftAt = 0
         bubble.items = []; refreshMode()                           // 打开前先按最新的状态算一遍，里面的字才对
+        let room = max(44, (mini ? mascotSide : stageTop) - 2)       // 气泡能用的高度：收起时是拉拉队那一块，展开时是面板上方那一截
+        bubble.maxH = room
         let sz = bubble.fittingSize(), u = mascotSide / 38
         render()                                                   // 收起状态下窗口要先往左伸出一块给气泡
         let headY = (10.4 + 0.9) * u                               // 脑袋中心的高度
-        let y = min(max(2, headY - sz.height * 0.42), max(2, mascotSide - sz.height - 2))
+        let y = min(max(1, headY - sz.height * 0.42), max(1, room - sz.height))
         bubble.tailY = headY - y
         bubble.autoresizingMask = [.minXMargin]                    // 钉在拉拉队左边，窗口变宽变窄都跟着右边走
         bubble.frame = NSRect(x: stage.bounds.width - mascotSide + bubbleTuck - sz.width, y: y, width: sz.width, height: sz.height)
@@ -2475,8 +2486,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var hotKeyRef: EventHotKeyRef?
     var hotKeyHandlerInstalled = false
-    var bubbleKeyRef: EventHotKeyRef?       // 气泡开着时临时登记的那个字母键
-    var bubbleKeyCode: UInt32?
+    var bubbleKeyRefs: [EventHotKeyRef?] = []      // 气泡开着时临时登记的字母键
+    var bubbleKeyCodes: [UInt32] = []
     var hotKeyOK = true
     var lastHits: [SearchHit] = []   // 「添加」页当前的搜索结果
     var adding = false               // 正在确认某只能不能加（防止连点加两次）
@@ -2569,8 +2580,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stage.addSubview(bubble)
         bubble.onPick = { [weak self] i in
             guard let self = self else { return }
-            if i == 1 { NSApp.terminate(nil); return }
+            if i == 2 { NSApp.terminate(nil); return }
             self.bubbleMuted = true
+            if i == 1 {
+                // 隐藏：不引入新的状态，只是已有两个状态的快捷入口。
+                //   展开着 → 拉拉队不再站在面板上，等同于把设置里的「拉拉队显示」改成「仅收起时」（面板留着，收起后它还在）
+                //   收起着 → 屏幕上只有它，那就把整个小窗藏起来（⌃⌥S 或顶部栏图标叫回）
+                self.closeBubble()
+                if self.mini { self.board.onClose?() }
+                else if !self.mutateConfigObject({ $0["mascotOnBoard"] = false }) { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+                return
+            }
             self.manual = !self.modeCheer            // 换成另一种模式
             self.refreshMode()
             // 鼠标这时还停在它身上。如果照旧算「在看它」，它会一直保持看着你的样子，等于点了没反应。
@@ -2921,6 +2941,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     return
                 }
+                if v == "hide" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        print("before 收起=\(self.mini) 显示设置=\(self.cfg.mascotOnBoard) 小窗可见=\(self.panel.isVisible) 看得见它=\(self.mascotVisible)")
+                        self.bubble.onPick?(1)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { print("after  收起=\(self.mini) 显示设置=\(self.cfg.mascotOnBoard) 小窗可见=\(self.panel.isVisible) 看得见它=\(self.mascotVisible && self.panel.isVisible) 气泡=\(self.bubbleOpen)"); fflush(stdout) }
+                    }
+                    return
+                }
                 guard v == "pick" else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     print("before manual=\(String(describing: self.manual)) resting0=\(self.resting0)")
@@ -3100,8 +3128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rows.append(PRow(sep: true))
         // 第二组：拉拉队（大小、花球、作息）
         if cfg.miniStyle != "face" {
-            setting("onboard", T("看行情时显示拉拉队", "Cheerleader while viewing"), current: cfg.mascotOnBoard ? "on" : "off",
-                    options: [("on", T("开", "On")), ("off", T("关", "Off"))]) { [weak self] v in
+            // 标签是名词，和这一组的另外三项一样；选项不写「开 / 关」，直接说它什么时候出现
+            setting("onboard", T("拉拉队显示", "Show cheerleader"), current: cfg.mascotOnBoard ? "on" : "off",
+                    options: [("on", T("始终", "Always")), ("off", T("仅收起时", "When shrunk"))]) { [weak self] v in
                 _ = self?.mutateConfigObject { $0["mascotOnBoard"] = (v == "on") }
             }
             setting("size", T("拉拉队大小", "Cheerleader size"), current: cfg.mascotSize,
@@ -3664,7 +3693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
             let id = hk.id
             DispatchQueue.main.async {
-                if id == 1 { AppDelegate.shared?.toggle() } else { AppDelegate.shared?.bubbleKeyPressed() }
+                if id == 1 { AppDelegate.shared?.toggle() } else { AppDelegate.shared?.bubbleKeyPressed(id) }
             }
             return noErr
         }, 1, &spec, nil, nil)
@@ -3680,18 +3709,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 用系统的快捷键登记，不抢键盘焦点：别的键照常打进用户正在用的程序里，只有这一个字母被接走
     func syncBubbleKey() {
         guard hotKeyHandlerInstalled else { return }
-        let want: UInt32? = bubbleOpen && panel.isVisible ? UInt32(modeCheer ? kVK_ANSI_R : kVK_ANSI_C) : nil
-        guard want != bubbleKeyCode else { return }
-        if let r = bubbleKeyRef { UnregisterEventHotKey(r); bubbleKeyRef = nil }
-        bubbleKeyCode = nil
-        if let code = want, RegisterEventHotKey(code, 0, EventHotKeyID(signature: OSType(0x5045454B), id: 2), GetApplicationEventTarget(), 0, &bubbleKeyRef) == noErr {
-            bubbleKeyCode = code
+        // 编号 2 是第一项（休息 R / 加油 C），编号 3 是隐藏 H
+        let want: [UInt32] = bubbleOpen && panel.isVisible ? [UInt32(modeCheer ? kVK_ANSI_R : kVK_ANSI_C), UInt32(kVK_ANSI_H)] : []
+        guard want != bubbleKeyCodes else { return }
+        for r in bubbleKeyRefs { if let r = r { UnregisterEventHotKey(r) } }
+        bubbleKeyRefs = []; bubbleKeyCodes = []
+        for (k, code) in want.enumerated() {
+            var ref: EventHotKeyRef?
+            RegisterEventHotKey(code, 0, EventHotKeyID(signature: OSType(0x5045454B), id: UInt32(2 + k)), GetApplicationEventTarget(), 0, &ref)
+            bubbleKeyRefs.append(ref)
         }
+        bubbleKeyCodes = want
     }
-    func bubbleKeyPressed() {
+    func bubbleKeyPressed(_ id: UInt32) {
         guard bubbleOpen else { return }
-        bubble.pressed = 0                                   // 和点下去一样亮一下再执行
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in self?.bubble.pressed = nil; self?.bubble.onPick?(0) }
+        let item = id == 3 ? 1 : 0
+        bubble.pressed = item                                // 和点下去一样亮一下再执行
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in self?.bubble.pressed = nil; self?.bubble.onPick?(item) }
     }
 
     func refresh() {
