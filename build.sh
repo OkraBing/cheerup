@@ -34,5 +34,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# 放在同步盘里的文件夹会被系统加上额外的标记，带着它签不了名，先清掉
+xattr -cr "$APP" 2>/dev/null || true
+codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "提示：没签上名（程序在本机仍然能用）"
 echo "已生成 $(pwd)/$APP"
