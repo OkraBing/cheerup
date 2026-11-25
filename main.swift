@@ -1,0 +1,3346 @@
+import Cocoa
+import Carbon.HIToolbox
+
+// MARK: - 语言
+
+/// 当前界面语言：zh 或 en。所有界面上的字都经过 T(中文, English) 取
+var lang = "zh"
+func T(_ zh: String, _ en: String) -> String { lang == "en" ? en : zh }
+/// 还没选过语言时，按系统语言猜一个
+func systemLang() -> String { (Locale.preferredLanguages.first ?? "zh").hasPrefix("zh") ? "zh" : "en" }
+
+// MARK: - 配置
+
+struct Config: Decodable {
+    var stocks: [String] = ["sh000001", "600519", "00700", "AAPL", "NVDA"]
+    var aliases: [String: String] = [:]
+    var refreshSeconds: Double = 3
+    var opacity: Double = 0.35
+    var hoverOpacity: Double = 0.95
+    var fontSize: Double = 11
+    var color: Bool = true
+    var theme: String = "dark"          // dark / light / none
+    var label: String = "name"          // name / code
+    var menuBarIcon: Bool = true
+    var hideFromScreenShare: Bool = true
+    var detailAutoCloseSeconds: Double = 5   // 详情展开后鼠标离开多久自动收起，0 = 不自动收
+    var maxVisibleRows: Int = 8              // 小窗最多同时显示几行，超出的在列表里滚动
+    var upColor: String = "red"              // A 股、港股页：涨用什么颜色，red 或 green
+    var usGreenUp: Bool = true               // 美股页按当地习惯绿涨红跌
+    var miniStyle: String = "cheer"          // 收起后的样子：cheer 啦啦队员 / face 笑脸
+    var language: String = ""                // 界面语言：zh / en；空着表示还没选，先跟系统
+    var mascotSize: String = "m"             // 收起后小人的大小：s / m / l
+    var restSchedule: String = "auto"        // 小人什么时候休息：auto 跟随当前标签页的市场 / a / hk / us / never 永不休息
+    var pomColor: String = "auto"            // 花球颜色：auto 跟随当前市场的涨色 / red / green / yellow / blue / white
+
+    init() {}
+
+    enum Keys: String, CodingKey {
+        case stocks, aliases, refreshSeconds, opacity, hoverOpacity, fontSize
+        case color, theme, label, menuBarIcon, hideFromScreenShare, detailAutoCloseSeconds, maxVisibleRows, upColor, usGreenUp, miniStyle, language, mascotSize, pomColor, restSchedule
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        let d = Config()
+        stocks = try c.decodeIfPresent([String].self, forKey: .stocks) ?? d.stocks
+        aliases = try c.decodeIfPresent([String: String].self, forKey: .aliases) ?? d.aliases
+        refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? d.refreshSeconds
+        opacity = try c.decodeIfPresent(Double.self, forKey: .opacity) ?? d.opacity
+        hoverOpacity = try c.decodeIfPresent(Double.self, forKey: .hoverOpacity) ?? d.hoverOpacity
+        fontSize = try c.decodeIfPresent(Double.self, forKey: .fontSize) ?? d.fontSize
+        color = try c.decodeIfPresent(Bool.self, forKey: .color) ?? d.color
+        theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? d.theme
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? d.label
+        menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
+        hideFromScreenShare = try c.decodeIfPresent(Bool.self, forKey: .hideFromScreenShare) ?? d.hideFromScreenShare
+        detailAutoCloseSeconds = try c.decodeIfPresent(Double.self, forKey: .detailAutoCloseSeconds) ?? d.detailAutoCloseSeconds
+        maxVisibleRows = try c.decodeIfPresent(Int.self, forKey: .maxVisibleRows) ?? d.maxVisibleRows
+        upColor = try c.decodeIfPresent(String.self, forKey: .upColor) ?? d.upColor
+        usGreenUp = try c.decodeIfPresent(Bool.self, forKey: .usGreenUp) ?? d.usGreenUp
+        miniStyle = try c.decodeIfPresent(String.self, forKey: .miniStyle) ?? d.miniStyle
+        language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
+        mascotSize = try c.decodeIfPresent(String.self, forKey: .mascotSize) ?? d.mascotSize
+        pomColor = try c.decodeIfPresent(String.self, forKey: .pomColor) ?? d.pomColor
+        restSchedule = try c.decodeIfPresent(String.self, forKey: .restSchedule) ?? d.restSchedule
+    }
+}
+
+let testHome = ProcessInfo.processInfo.environment["PEEK_HOME"]      // 测试用：换一个配置目录，不碰正式配置
+let configDir = testHome.map { URL(fileURLWithPath: $0) }
+    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cheerup")
+let configURL = configDir.appendingPathComponent("config.json")
+let store = testHome == nil ? UserDefaults.standard : (UserDefaults(suiteName: "local.cheerup.test") ?? .standard)
+let maxStocks = 50
+let pomColors = ["auto", "red", "green", "yellow", "blue", "white"]
+/// 测试用：测试目录里有 offline 文件时，把请求指到一个连不上的地址，模拟断网
+func host(_ real: String) -> String {
+    if let t = testHome, FileManager.default.fileExists(atPath: t + "/offline") { return "https://127.0.0.1:9/" }
+    return real
+}
+var requestCount = 0     // 测试用：发出过多少次网络请求
+
+let defaultConfigText = """
+{
+  "stocks": ["sh000001", "600519", "00700", "AAPL", "NVDA"],
+  "aliases": {},
+  "refreshSeconds": 3,
+  "opacity": 0.35,
+  "hoverOpacity": 0.95,
+  "fontSize": 11,
+  "color": true,
+  "theme": "dark",
+  "label": "name",
+  "menuBarIcon": true,
+  "hideFromScreenShare": true,
+  "detailAutoCloseSeconds": 5,
+  "maxVisibleRows": 8
+}
+"""
+
+extension Config {
+    /// 把写错范围的数值拉回安全区间，避免出现「透明度 0 找不到窗口」这类自己把自己锁在外面的情况
+    func sanitized() -> Config {
+        var c = self
+        var seen = Set<String>()
+        c.stocks = stocks.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert(isValidCode($0) ? apiSymbol($0) : $0).inserted }
+        c.opacity = min(max(opacity, 0.08), 1)
+        c.hoverOpacity = min(max(hoverOpacity, max(c.opacity, 0.3)), 1)
+        c.fontSize = min(max(fontSize, 8), 22)
+        c.refreshSeconds = max(refreshSeconds, 2)
+        c.detailAutoCloseSeconds = max(detailAutoCloseSeconds, 0)
+        c.maxVisibleRows = min(max(maxVisibleRows, 3), 20)
+        if !["dark", "light", "none"].contains(theme) { c.theme = "dark" }
+        if !["name", "code"].contains(label) { c.label = "name" }
+        if !["red", "green"].contains(upColor) { c.upColor = "red" }
+        if !["cheer", "face"].contains(miniStyle) { c.miniStyle = "cheer" }
+        if !["zh", "en"].contains(language) { c.language = "" }
+        if !["s", "m", "l"].contains(mascotSize) { c.mascotSize = "m" }
+        if !pomColors.contains(pomColor) { c.pomColor = "auto" }
+        if !["auto", "a", "hk", "us", "never"].contains(restSchedule) { c.restSchedule = "auto" }
+        return c
+    }
+}
+
+func decodeConfig(_ data: Data) -> Config? {
+    (try? JSONDecoder().decode(Config.self, from: data))?.sanitized()
+}
+
+/// 返回 nil 表示配置文件存在但格式有误：调用方应保留上一份可用配置，而不是换成默认股票
+func loadConfig() -> Config? {
+    if !FileManager.default.fileExists(atPath: configURL.path) {
+        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try? defaultConfigText.write(to: configURL, atomically: true, encoding: .utf8)
+    }
+    guard let data = try? Data(contentsOf: configURL) else { return nil }
+    return decodeConfig(data)
+}
+
+// MARK: - 行情
+
+struct Quote {
+    var name: String
+    var code: String
+    var price: Double
+    var prevClose: Double
+    var open: Double
+    var high: Double
+    var low: Double
+    var time: String
+    var stamp: Date? = nil             // 最新一笔行情的时刻（已按所在市场的时区换算）
+    var f: [String] = []
+    func str(_ i: Int) -> String { i < f.count ? f[i] : "" }
+    func num(_ i: Int) -> Double? { i < f.count ? Double(f[i]) : nil }
+    var live: Bool { price > 0 }       // 集合竞价前、停牌时接口给的现价是 0，不能当成跌了 100%
+    var change: Double { live ? price - prevClose : 0 }
+    var pct: Double { live && prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0 }
+    var dir: Int { pct > 0.0001 ? 1 : (pct < -0.0001 ? -1 : 0) }
+}
+
+/// 三个市场的规则不一样：交易时段、时区、币种、有没有涨跌停、成交量单位都不同
+enum Market {
+    case aStock, aIndex, hk, us
+
+    var currency: String { self == .hk ? T("港元", "HKD") : (self == .us ? T("美元", "USD") : "") }
+    var zone: TimeZone {
+        TimeZone(identifier: self == .us ? "America/New_York" : (self == .hk ? "Asia/Hong_Kong" : "Asia/Shanghai")) ?? .current
+    }
+    /// 常规交易时段（当地时间的分钟数，含首尾）
+    var sessions: [(Int, Int)] {
+        switch self {
+        case .aStock, .aIndex: return [(570, 690), (780, 900)]     // 9:30–11:30、13:00–15:00
+        case .hk: return [(570, 720), (780, 960)]                  // 9:30–12:00、13:00–16:00
+        case .us: return [(570, 960)]                              // 美东 9:30–16:00
+        }
+    }
+    static func of(_ key: String, type: String = "") -> Market {
+        if key.hasPrefix("r_hk") || key.hasPrefix("hk") { return .hk }
+        if key.hasPrefix("sh") || key.hasPrefix("sz") || key.hasPrefix("bj") { return type.contains("ZS") ? .aIndex : .aStock }
+        return .us
+    }
+    /// 现在这个市场处在什么状态。stamp 是最新一笔行情的时间：日程上该交易却很久没有新行情，说明是节假日休市
+    func status(now: Date = Date(), stamp: Date?) -> (text: String, live: Bool) {
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = zone
+        let c = cal.dateComponents([.weekday, .hour, .minute], from: now)
+        let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        let closedDay = (T("休市", "Closed"), false), pre = (T("未开盘", "Opens later"), false), auction = (T("集合竞价", "Auction"), true)
+        let open = (T("交易中", "Open"), true), lunch = (T("午休", "Lunch break"), false), closed = (T("已收盘", "Closed"), false)
+        if c.weekday == 1 || c.weekday == 7 { return closedDay }
+        var r: (String, Bool)
+        switch self {
+        case .aStock, .aIndex:
+            r = m < 555 ? pre : m < 570 ? auction : m <= 690 ? open : m < 780 ? lunch : m <= 900 ? open : closed
+        case .hk:
+            r = m < 540 ? pre : m < 570 ? auction : m <= 720 ? open : m < 780 ? lunch : m <= 960 ? open : m < 970 ? auction : closed
+        case .us:
+            r = m < 240 ? closed : m < 570 ? (T("盘前", "Pre-market"), false) : m <= 960 ? open : m < 1200 ? (T("盘后", "After hours"), false) : closed
+        }
+        if r.1, let s = stamp, now.timeIntervalSince(s) > 1800 { return closedDay }
+        return r
+    }
+}
+
+/// 代码只能是字母、数字、点、下划线；中文名或带空格的写法接口不认，还会让整条请求失败
+func isValidCode(_ raw: String) -> Bool {
+    let ok = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._")
+    return !raw.isEmpty && raw.count <= 16 && raw.unicodeScalars.allSatisfy { ok.contains($0) }
+}
+
+/// 把用户写的代码转成接口用的代码：600519 → sh600519，00700 → r_hk00700，AAPL → usAAPL
+func apiSymbol(_ raw: String) -> String {
+    let s = raw.trimmingCharacters(in: .whitespaces)
+    let digits = CharacterSet.decimalDigits
+    func allDigits(_ t: Substring) -> Bool { !t.isEmpty && t.unicodeScalars.allSatisfy { digits.contains($0) } }
+
+    for p in ["sh", "sz", "bj"] where s.hasPrefix(p) && s.count == 8 && allDigits(s.dropFirst(2)) { return s }
+    if s.hasPrefix("hk") {
+        let rest = s.dropFirst(2)
+        if allDigits(rest) { return "r_hk" + String(repeating: "0", count: max(0, 5 - rest.count)) + rest }
+        return "r_hk" + rest.uppercased()
+    }
+    if s.hasPrefix("us") && s.count > 2 { return "us" + s.dropFirst(2).uppercased() }
+    if allDigits(Substring(s)) {
+        if s.count == 6 {
+            if s.hasPrefix("92") || s.hasPrefix("4") || s.hasPrefix("8") { return "bj" + s }
+            if s.hasPrefix("6") || s.hasPrefix("9") || s.hasPrefix("5") { return "sh" + s }
+            return "sz" + s
+        }
+        if s.count <= 5 { return "r_hk" + String(repeating: "0", count: 5 - s.count) + s }
+    }
+    return "us" + s.uppercased()
+}
+
+private var stampFormatters: [String: DateFormatter] = [:]
+private let stampLock = NSLock()
+/// 三个市场各用一种时间写法和时区。格式化对象创建很慢，建一次反复用（解析在后台线程，所以加锁）
+func stampFormatter(_ m: Market, _ sample: String) -> DateFormatter {
+    let fmt = sample.contains("/") ? "yyyy/MM/dd HH:mm:ss" : (sample.contains("-") ? "yyyy-MM-dd HH:mm:ss" : "yyyyMMddHHmmss")
+    let key = m.zone.identifier + fmt
+    stampLock.lock(); defer { stampLock.unlock() }
+    if let f = stampFormatters[key] { return f }
+    let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = m.zone; f.dateFormat = fmt
+    stampFormatters[key] = f
+    return f
+}
+
+let gbk = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+    CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+
+func parseQuotes(_ text: String) -> [String: Quote] {
+    var out: [String: Quote] = [:]
+    for line in text.split(separator: ";") {
+        guard let eq = line.firstIndex(of: "="),
+              let v = line.range(of: "v_") else { continue }
+        let key = String(line[v.upperBound..<eq])
+        let body = line[line.index(after: eq)...].trimmingCharacters(in: CharacterSet(charactersIn: "\"\n\r "))
+        let f = body.components(separatedBy: "~")
+        guard f.count > 34, let price = Double(f[3]), let prev = Double(f[4]) else { continue }
+        // 三个市场的时间写法各不相同，时区也不同
+        let stamp = stampFormatter(Market.of(key), f[30]).date(from: f[30])
+        var time = f[30]
+        if time.count == 14, !time.contains(":") {           // 20261125104627
+            let t = Array(time); time = "\(t[8])\(t[9]):\(t[10])\(t[11])"
+        } else if let sp = time.firstIndex(of: " ") {         // 2026/11/25 10:46:25
+            time = String(time[time.index(after: sp)...].prefix(5))
+        }
+        out[key] = Quote(name: f[1], code: f[2], price: price, prevClose: prev,
+                         open: Double(f[5]) ?? 0, high: Double(f[33]) ?? 0, low: Double(f[34]) ?? 0, time: time, stamp: stamp, f: f)
+    }
+    return out
+}
+
+func fmt(_ v: Double) -> String {
+    String(format: abs(v) < 1 ? "%.3f" : "%.2f", v)
+}
+/// 价格类字段：0 表示没有数据，显示成「—」
+func fmtP(_ v: Double) -> String { v > 0 ? fmt(v) : "—" }
+
+/// 把用户敲进搜索框的东西整理成接口能认的关键词。返回 nil 表示没有可搜的内容
+/// - 全角转半角；去掉接口不认的符号（引号、尖括号等会让接口直接报错）
+/// - 中文里的空格全部去掉（「茅 台」接口搜不到）；英文只把连续空格并成一个
+/// - 「sh600519」「hk00700」这种带市场前缀的写法，接口不认：拆成关键词 + 只看这个市场
+func cleanQuery(_ raw: String) -> (q: String, market: String?)? {
+    var t = (raw.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? raw).trimmingCharacters(in: .whitespacesAndNewlines)
+    t = String(t.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) || $0 == "." || $0 == " " || $0 == "*" })
+    let hasCJK = t.unicodeScalars.contains { $0.value >= 0x2E80 }
+    if hasCJK { t = t.replacingOccurrences(of: " ", with: "") }
+    else { t = t.split(separator: " ").joined(separator: " ") }
+    t = String(t.prefix(24))
+    guard !t.isEmpty else { return nil }
+    let lower = t.lowercased()
+    for m in ["sh", "sz", "bj", "hk"] where lower.hasPrefix(m) {
+        let rest = String(t.dropFirst(2))
+        let digits = !rest.isEmpty && rest.allSatisfy { $0.isNumber }
+        if digits || (m == "hk" && rest.count >= 2 && rest == rest.uppercased() && rest.allSatisfy({ $0.isLetter })) { return (rest, m) }
+    }
+    if t.hasPrefix("us"), t.count > 2 {            // 只认「us」小写 + 后面全大写（usAAPL、us.IXIC），免得把 usb 这种词拆错
+        let rest = String(t.dropFirst(2))
+        if rest == rest.uppercased(), rest.contains(where: { $0.isLetter }) { return (rest.hasPrefix(".") ? String(rest.dropFirst()) : rest, "us") }
+    }
+    return (t, nil)
+}
+
+/// 解析搜索接口：v_hint="sh~600519~贵州茅台~gzmt~GP-A^hk~00700~…"
+/// 只留 A 股 / 港股 / 美股里能看行情的品种，去掉基金、权证、人民币柜台这些干扰项，再按和关键词的贴近程度排序
+func parseSearch(_ text: String, query: String = "", market: String? = nil) -> [AppDelegate.SearchHit] {
+    guard let a = text.range(of: "\""), let b = text.range(of: "\"", options: .backwards), a.upperBound < b.lowerBound else { return [] }
+    var out: [(hit: AppDelegate.SearchHit, score: Int)] = []
+    let marketName = ["sh": T("沪", "SH"), "sz": T("深", "SZ"), "bj": T("北", "BJ"), "hk": T("港股", "HK"), "us": T("美股", "US")]
+    let q = query.lowercased()
+    for (n, item) in text[a.upperBound..<b.lowerBound].components(separatedBy: "^").enumerated() {
+        let f = item.components(separatedBy: "~")
+        guard f.count >= 3, let mk = marketName[f[0]] else { continue }          // jj（场外基金）等不在三个市场里的直接跳过
+        if let m = market, m != f[0], !(m == "sh" && false) { continue }
+        let type = f.count > 4 ? f[4] : ""
+        if type == "QZ" { continue }                                             // 权证 / 牛熊证
+        // 名称里的中文是 \uXXXX 转义，借 JSON 解码还原
+        var name = ((try? JSONSerialization.jsonObject(with: Data("\"\(f[2])\"".utf8), options: .fragmentsAllowed)) as? String) ?? f[2]
+        if f[0] == "hk", f[1].count == 5, f[1].hasPrefix("8"), name.lowercased().hasSuffix("r") { continue }   // 港股人民币柜台，和港币的那只是同一家
+        // 接口给的英文全是小写：纯英文名按单词首字母大写；中英混排的（腾讯音乐sw、xx etf）把英文部分整个大写
+        if name == name.lowercased(), name.contains(where: { $0.isASCII && $0.isLetter }) {
+            name = name.unicodeScalars.allSatisfy({ $0.isASCII }) ? name.capitalized : name.uppercased()
+        }
+        var code: String, short: String
+        switch f[0] {
+        case "hk": code = "hk" + f[1]; short = f[1].uppercased()
+        case "us":
+            var parts = f[1].components(separatedBy: ".")
+            if parts.count > 1 { parts.removeLast() }                            // 去掉交易所后缀：aapl.oq → AAPL，brk.b.n → BRK.B
+            short = parts.joined(separator: ".").uppercased()
+            if type == "ZS" { short = "." + short }                              // 美股指数：ixic → .IXIC
+            code = "us" + short
+        default: code = apiSymbol(f[1]) == f[0] + f[1] ? f[1] : f[0] + f[1]; short = f[1]     // 能自动认出市场的就只写数字
+        }
+        guard isValidCode(code) else { continue }
+        let tag = type == "ZS" ? T("指数", "Index") : (type.contains("ETF") ? "ETF" : (type.contains("LOF") ? "LOF" : mk))
+        // 分数越小越靠前：先按接口给的顺序，再把「代码或名称完全一致」的提到最前，把衍生品、场外品种往后放
+        var score = n * 2
+        let lname = name.lowercased()
+        if !q.isEmpty {
+            func noLead(_ x: String) -> String { String(x.drop { $0 == "0" }) }       // 「700」和「00700」算同一个代码
+            let digits = q.allSatisfy { $0.isNumber }
+            if short.lowercased() == q || f[1].lowercased() == q || (digits && f[0] == "hk" && noLead(short) == noLead(q)) { score -= 100 }
+            let otc = f[0] == "us" && f[1].hasSuffix(".ps")
+            if lname == q, !otc { score -= 90 } else if lname.hasPrefix(q) { score -= 10 }
+            if type == "ZS", lname != q { score += 3 }                           // 名字只是沾边的指数，排在同名的股票后面
+        }
+        if type.contains("ETF") || type.contains("LOF") || type == "FJ" { score += 14 }
+        if f[0] == "us", f[1].hasSuffix(".ps") { score += 30 }                   // 美股场外（粉单）
+        if ["做多", "做空", "倍", "期权", "etf", "c/wts", "unit", "warrant"].contains(where: { lname.contains($0) }) { score += 24 }
+        out.append((.init(code: code, name: name, shortCode: short, market: mk, tag: tag), score))
+    }
+    var seen = Set<String>()
+    return out.sorted { $0.score < $1.score }.map { $0.hit }.filter { seen.insert(apiSymbol($0.code)).inserted }
+}
+
+/// 常用的大盘指数。搜索接口对「恒生」「纳指」「标普」这类口头叫法经常搜不到指数本身，这里直接认
+let commonIndexes: [(keys: [String], code: String, zh: String, en: String, short: String)] = [
+    (["上证", "沪指", "大盘", "sse", "shanghai"], "sh000001", "上证指数", "SSE Composite", "000001"),
+    (["深证", "深成", "szse", "shenzhen"], "sz399001", "深证成指", "SZSE Component", "399001"),
+    (["创业板", "chinext"], "sz399006", "创业板指", "ChiNext", "399006"),
+    (["科创", "star50", "star 50"], "sh000688", "科创50", "STAR 50", "000688"),
+    (["沪深300", "csi300", "csi 300"], "sh000300", "沪深300", "CSI 300", "000300"),
+    (["恒生", "恒指", "hang seng", "hangseng", "hsi"], "hkHSI", "恒生指数", "Hang Seng", "HSI"),
+    (["恒生科技", "恒科", "hstech", "hang seng tech"], "hkHSTECH", "恒生科技指数", "Hang Seng Tech", "HSTECH"),
+    (["纳斯达克", "纳指", "nasdaq", "ixic"], "us.IXIC", "纳斯达克", "Nasdaq Composite", ".IXIC"),
+    (["道琼斯", "道指", "dow", "dji"], "us.DJI", "道琼斯", "Dow Jones", ".DJI"),
+    (["标普", "s&p", "sp500", "sp 500", "spx", "inx"], "us.INX", "标普500", "S&P 500", ".INX"),
+]
+func indexHits(_ raw: String, market: String?) -> [AppDelegate.SearchHit] {
+    let q = raw.lowercased().trimmingCharacters(in: .whitespaces)
+    guard q.count >= 2 else { return [] }
+    return commonIndexes.filter { e in e.keys.contains { $0.hasPrefix(q) || q.hasPrefix($0) } }
+        .filter { e in market.map { e.code.hasPrefix($0) } ?? true }
+        .map { .init(code: $0.code, name: T($0.zh, $0.en), shortCode: $0.short, market: "", tag: T("指数", "Index")) }
+}
+
+/// 看起来像一个代码（不是名称）的输入，可能对应哪些行情代码。搜索服务不通或搜不到时，直接拿去问行情接口
+func codeCandidates(_ q: String) -> [String] {
+    let t = q.replacingOccurrences(of: " ", with: "")
+    if t.allSatisfy({ $0.isNumber }) {
+        if t.count == 6 { return ["sh" + t, "sz" + t, "bj" + t] }
+        if t.count >= 1, t.count <= 5 { return ["r_hk" + String(repeating: "0", count: 5 - t.count) + t] }
+        return []
+    }
+    if t.count <= 6, t.allSatisfy({ ($0.isASCII && $0.isLetter) || $0 == "." }), t.contains(where: { $0.isLetter }) { return ["us" + t.uppercased()] }
+    return []
+}
+
+/// 东方财富的证券编号：沪市 1.xxxxxx，深市 / 北交所 0.xxxxxx，港股 116.xxxxx，美股按交易所 105 / 106 / 107
+func eastmoneySecid(key: String, market: Market, code: String) -> String? {
+    switch market {
+    case .aStock, .aIndex: return (key.hasPrefix("sh") ? "1." : "0.") + key.dropFirst(2)
+    case .hk:
+        let c = String(key.dropFirst(4))
+        return c.allSatisfy(\.isNumber) ? "116." + c : nil
+    case .us:
+        let parts = code.components(separatedBy: ".")
+        guard parts.count == 2, !parts[0].isEmpty else { return nil }
+        let ex = ["OQ": "105", "N": "106", "AM": "107", "A": "107"][parts[1]]
+        return ex.map { $0 + "." + parts[0] }
+    }
+}
+
+/// 解析东方财富分时：每行「2026-11-25 09:30,价格,这一分钟的量,这一分钟的额,均价」
+func parseEastmoneyMinutes(_ data: Data) -> MinuteData {
+    var m = MinuteData()
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let lines = (root["data"] as? [String: Any])?["trends"] as? [String] else { return m }
+    var avgOK = true
+    for l in lines {
+        let p = l.components(separatedBy: ",")
+        guard p.count >= 3, let price = Double(p[1]), price > 0, p[0].count >= 16 else { continue }
+        m.prices.append(price); m.vols.append(max(0, Double(p[2]) ?? 0))
+        m.times.append(String(p[0].suffix(5)).replacingOccurrences(of: ":", with: ""))
+        if avgOK, p.count > 4, let a = Double(p[4]), a > 0, abs(a / price - 1) < 0.2 { m.avg.append(a) } else { avgOK = false }
+    }
+    if !avgOK || m.avg.count != m.prices.count { m.avg = [] }
+    return m
+}
+
+struct MinuteData { var prices: [Double] = [], vols: [Double] = [], times: [String] = [], avg: [Double] = [] }
+
+/// 解析分时接口。每行是「时间 价格 累计成交量 [累计成交额]」；美股没有成交额，所以没有均价线
+func parseMinutes(_ data: Data, code: String, market: Market) -> MinuteData {
+    var m = MinuteData()
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let d = (root["data"] as? [String: Any])?[code] as? [String: Any],
+          let lines = (d["data"] as? [String: Any])?["data"] as? [String] else { return m }
+    let unit = market == .aStock ? 100.0 : 1.0       // A 股成交量单位是手（100 股），港股是股
+    var lastCum = 0.0, avgOK = market == .aStock || market == .hk
+    for l in lines {
+        let p = l.split(separator: " ")
+        guard p.count > 2, let price = Double(p[1]), price > 0 else { continue }
+        let cum = Double(p[2]) ?? lastCum
+        m.prices.append(price); m.vols.append(max(0, cum - lastCum)); m.times.append(String(p[0]))
+        lastCum = cum
+        if avgOK, p.count > 3, let amt = Double(p[3]), cum > 0 {
+            let a = amt / (cum * unit)
+            if abs(a / price - 1) < 0.2 { m.avg.append(a) } else { avgOK = false }     // 算出来离谱（比如指数）就不画均价线
+        } else { avgOK = false }
+    }
+    if !avgOK || m.avg.count != m.prices.count { m.avg = [] }
+    return m
+}
+
+// MARK: - 啦啦队动作
+
+/// 小人的一个姿势。角度是手臂相对水平线的仰角（度）：-50 垂在身侧，0 平举，90 笔直向上
+struct Pose: Equatable {
+    var aL: CGFloat = -50      // 左臂
+    var aR: CGFloat = -50      // 右臂
+    var leg: CGFloat = 3.4     // 两脚各离中线多远
+    var liftL: CGFloat = 0     // 左脚抬起多高（负数是抬起）
+    var liftR: CGFloat = 0     // 右脚
+    var hop: CGFloat = 0       // 离地多高：负数是跳起来，正数是下蹲
+    var lean: CGFloat = 0      // 上身往哪边倾
+    var spin: CGFloat = 0      // 星号转了几格（1 格 = 60°，转满一格看起来和没转一样）
+    var toss: CGFloat = 0      // 花球抛到哪了：0 在手里，0→1 是抛起、在空中转、落回手里
+    var face = 1               // 表情：0 闭眼  1 平时（半垂眼、平嘴）  2 用力（嘴张成小 o）  3 偷看（睁一只眼）  4 淡淡一笑
+    var blink = false          // 这一瞬间在眨眼
+    var z: CGFloat = 0         // 睡着时头边飘的 z：0 是没有，其余是飘到哪了（0–1 循环）
+
+    func mix(_ o: Pose, _ t: CGFloat) -> Pose {
+        func m(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
+        return Pose(aL: m(aL, o.aL), aR: m(aR, o.aR), leg: m(leg, o.leg), liftL: m(liftL, o.liftL), liftR: m(liftR, o.liftR),
+                    hop: m(hop, o.hop), lean: m(lean, o.lean), spin: m(spin, o.spin), toss: m(toss, o.toss),
+                    face: t < 0.35 ? face : o.face,       // 表情不渐变：动作做到三分之一时换成下一个
+                    z: o.z)
+    }
+
+    /// 休息时也不是一动不动：慢慢呼吸、轻轻晃；睡着（市场休息）时头边飘 z，每隔一阵睁一只眼偷看一下
+    static func resting(at t: Double, asleep: Bool) -> Pose {
+        var p = Pose.rest
+        let breath = CGFloat(sin(t * 2 * .pi / 3.4))                 // 3.4 秒一次呼吸
+        p.hop = 1.2 + 0.7 * breath                                   // 歇着时也微微一蹲一起
+        p.aL = -32 - 2.5 * breath; p.aR = -32 - 2.5 * breath        // 吸气时肩膀带着手微微抬一点
+        p.lean = 0.45 * CGFloat(sin(t * 2 * .pi / 7.8))             // 很慢地左右晃
+        if !asleep { p.face = 1 }                                    // 醒着歇：睁着眼
+        if asleep {
+            p.z = CGFloat((t / 4.2).truncatingRemainder(dividingBy: 1)) * 0.98 + 0.01      // 一个 z 从冒出来到消失 4.2 秒
+            let c = t.truncatingRemainder(dividingBy: 11)
+            if c > 9.6, c < 10.5 { p.face = 3 }                     // 偷看：睁开一只眼
+        }
+        return p
+    }
+    static let rest = Pose(aL: -32, aR: -32, leg: 2.8, hop: 0.9, lean: 0, spin: 0, face: 0)      // 休息：手松松地垂在身侧，闭眼歇着
+}
+
+/// 一整套动作：每一步是「用多久摆到这个姿势」和「停多久」。主题是上涨——
+/// 开场跳起举高、左右交替上举、平举展开、摆出一条往右上的斜线、像台阶一样一级级举高、最后大跳收在高举
+let cheerRoutine: [(pose: Pose, move: Double, hold: Double)] = [
+    (Pose(), 0.40, 0.45),                                                                    // 预备，微笑
+    (Pose(aL: -60, aR: -60, leg: 4.6, hop: 3.0, face: 2), 0.20, 0.10),                       // 深蹲蓄力
+    (Pose(aL: 36, aR: 36, leg: 2.6, liftL: -1.2, liftR: -1.2, hop: -3.3, spin: 1, face: 2), 0.34, 0.16),   // 跳起，收腿，双手举成 V，在最高处停一下
+    (Pose(aL: 28, aR: 28, leg: 4.2, hop: 1.8, spin: 1), 0.24, 0.08),                         // 落地，蹲一下缓冲
+    (Pose(aL: 33, aR: 33, spin: 1), 0.16, 0.25),                                             // 站直定住
+    (Pose(aL: 38, aR: 38, toss: 1, face: 2), 0.70, 0.12),                                    // 把花球抛起来，在空中转，接住
+    (Pose(aL: -12, aR: 44, liftL: -2.2, lean: 0.8, spin: 1), 0.30, 0.30),                    // 右手上举，左手斜伸，抬左脚
+    (Pose(aL: 44, aR: -12, liftR: -2.2, lean: -0.8, spin: 1), 0.30, 0.30),                   // 换边，抬右脚
+    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 2.4, spin: 1), 0.28, 0.14),                           // 双手平举，扎个马步
+    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 1.2, spin: 1), 0.14, 0.00),                           // 弹一下
+    (Pose(aL: 0, aR: 0, leg: 5.8, hop: 2.4, spin: 1), 0.14, 0.18),                           // 再蹲
+    (Pose(aL: -18, aR: 47, leg: 4.6, lean: 1.5, spin: 1), 0.30, 0.60),                       // 左手压低、右手高举，身体跟着倾：上涨的手势，但两臂不连成一条直线
+    (Pose(aL: -55, aR: -55, leg: 4.4, hop: 2.6, spin: 1, face: 2), 0.24, 0.12),              // 收回并蹲到底，用力
+    (Pose(aL: -15, aR: -15, leg: 4.0, hop: 1.5, spin: 1, face: 2), 0.16, 0.12),              // 台阶一：一级级站起来、把手举高
+    (Pose(aL: 12, aR: 12, leg: 3.6, hop: 0.4, spin: 1, face: 2), 0.16, 0.12),                // 台阶二
+    (Pose(aL: 33, aR: 33, hop: -1.2, spin: 1, face: 2), 0.16, 0.12),                         // 台阶三
+    (Pose(aL: 44, aR: 44, leg: 6.8, hop: -3.6, spin: 4, face: 2), 0.36, 0.26),               // 大跳，手脚全打开成一个 X，在空中多停一会儿，花球跟着转
+    (Pose(aL: 26, aR: 26, leg: 4.4, hop: 2.0, spin: 4), 0.26, 0.08),                         // 落地，蹲一下
+    (Pose(aL: 33, aR: 33, spin: 4), 0.20, 0.20),                                             // 高举定住
+    (Pose(aL: 38, aR: 38, toss: 1, face: 2), 0.85, 0.00),                                    // 再抛一次，抛得更高
+    (Pose(aL: 33, aR: 33, face: 4), 0.12, 0.85),                                             // 接住，淡淡一笑
+    (Pose(face: 0), 0.50, 1.20),                                                    // 放下，闭眼歇一口气再来
+]
+let cheerRoutineLength: Double = cheerRoutine.reduce(0) { $0 + $1.move + $1.hold }
+
+/// 这套动作播到第 time 秒时的姿势（循环）
+func cheerPose(at time: Double) -> Pose {
+    var t = time.truncatingRemainder(dividingBy: cheerRoutineLength)
+    if t < 0 { t += cheerRoutineLength }
+    var prev = cheerRoutine[cheerRoutine.count - 1].pose
+    prev.spin = 0                                   // 上一轮结束时星号转了整数格，看起来和 0 一样，从 0 接上
+    for step in cheerRoutine {
+        if t < step.move {
+            let x = CGFloat(t / step.move)
+            let smooth = x * x * (3 - 2 * x)                       // 起步和收尾都缓一点
+            var r = prev.mix(step.pose, smooth)
+            func lerp(_ a: CGFloat, _ b: CGFloat, _ k: CGFloat) -> CGFloat { a + (b - a) * k }
+            // 高度单独算：往上是先快后慢（冲上去、到顶减速），从空中往下是先慢后快（在顶上停一下再掉下来），这样才有腾空感
+            let rising = step.pose.hop < prev.hop - 0.5, falling = prev.hop < -0.5 && step.pose.hop > prev.hop
+            let eh = rising ? 1 - pow(1 - x, 3) : (falling ? x * x * x : smooth)
+            r.hop = lerp(prev.hop, step.pose.hop, eh)
+            r.leg = lerp(prev.leg, step.pose.leg, rising ? 1 - pow(1 - x, 2) : smooth)
+            // 手臂甩过头一点再回来，动作更脆
+            let k: CGFloat = 1.4, y = x - 1
+            let ea = 1 + (k + 1) * y * y * y + k * y * y
+            r.aL = lerp(prev.aL, step.pose.aL, ea); r.aR = lerp(prev.aR, step.pose.aR, ea)
+            return r
+        }
+        t -= step.move
+        if t < step.hold { return step.pose }
+        t -= step.hold
+        prev = step.pose
+        if prev.toss >= 1 { prev.toss = 0 }        // 抛完已经接住了，下一个动作从「在手里」接上
+    }
+    return prev
+}
+
+/// 手势诊断日志：最多留最近 200 行，写在配置目录里
+var glogLines: [String] = ((try? String(contentsOf: configDir.appendingPathComponent("gesture.log"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+func glog(_ s0: String) {}      // 手势诊断日志：问题已定位，不再记录
+
+// MARK: - 视图
+
+struct Cell {
+    var text: String
+    var right = false    // 数值右对齐，文字左对齐
+    var tint = false     // 跟随涨跌上色
+    var dim = false      // 次要信息，颜色淡一点
+    var whole = false    // 整句提示，不截断
+}
+
+struct Row {
+    var cells: [Cell]
+    var direction: Int   // 1 涨 / -1 跌 / 0 平
+}
+
+struct Stat {
+    var id = ""                // 用来查解释，和语言无关
+    var label: String
+    var value: String
+    var tint: Int? = nil       // 1 按涨色 / -1 按跌色
+}
+
+struct Detail {
+    var name = ""
+    var code = ""              // 代码，港美股后面带币种
+    var statusText = ""        // 交易中 11:45 / 已收盘 美东 16:00
+    var live = false
+    var direction = 0
+    var price = 0.0, prevClose = 0.0, open = 0.0, high = 0.0, low = 0.0
+    var buy = 0.0, sell = 0.0  // 主动买 / 主动卖（外盘 / 内盘），都是 0 就不画
+    var core: [Stat] = []      // 默认显示的指标
+    var more: [Stat] = []      // 点「更多」才显示的指标
+    var spark: [Double] = []
+    var avg: [Double] = []     // 均价线，和 spark 一一对应；没有就是空
+    var vols: [Double] = []    // 每分钟成交量，和 spark 一一对应
+    var times: [String] = []   // 每分钟的时间 "0930"，和 spark 一一对应
+    var chartNote: String?     // 走势图没数据时显示的一句话
+    var sessions: [(Int, Int)] = []    // 交易时段，用来推算还没走到的时间
+    var sparkTotal = 1         // 全天应有的分钟数，用来让走势线按时间铺开
+}
+
+/// 鼠标指到哪个指标，标题行就显示它的一句解释
+func gloss(_ id: String) -> String? {
+    switch id {
+    case "open": return T("今天的开盘价", "Today's opening price")
+    case "prev": return T("昨天的收盘价，涨跌幅按它算", "Yesterday's close. Change is measured from it")
+    case "amount": return T("今天成交的总金额", "Total value traded today")
+    case "turnover": return T("今天成交的股数占流通股的比例", "Share of the float traded today")
+    case "#range": return T("横线是今天最低到最高，色块是开盘到现价", "Line: today's low to high. Block: open to now")
+    case "#flow": return T("主动买入和主动卖出各占多少", "Buyer-initiated vs seller-initiated volume")
+    default: return nil
+    }
+}
+
+final class BoardView: NSView, NSTextFieldDelegate {
+    // —— 页面（添加 / 菜单 / 引导）——
+    var page: Page = .list
+    var pageTitle = ""
+    var pageRows: [PRow] = []
+    var pageMinRows = 0                 // 至少留这么多行的高度，结果多少都不让小窗忽高忽低
+    var pageFoot = ""                   // 页面底部的一句话
+    var pageFootAccent = false
+    var pageNav: [(String, () -> Void)] = []     // 页面底部右侧的文字按钮
+    var pageDots: (Int, Int)?           // 引导的进度点：第几步 / 共几步
+    /// 页面标题条右侧、关闭按钮左边的一个图标按钮（设置页的「恢复默认」）。armed 表示已点过一次、等确认
+    var pageAction: (tip: String, armed: Bool, action: () -> Void)?
+    var keySel = 0                      // 键盘选中的是第几个可点的行
+    var onBack: (() -> Void)?
+    /// 设置项的下拉列表：浮在那一行的值下面，盖住后面的行，不改变小窗高度
+    struct Dropdown { var row: Int; var options: [String]; var current: Int; var anchor: NSPoint? = nil; var pick: (Int) -> Void }
+    var dropdown: Dropdown? { didSet { needsDisplay = true } }
+    var dropSel = 0
+    private func dropGeometry() -> (box: NSRect, rows: [NSRect]) {
+        guard let d = dropdown else { return (.zero, []) }
+        let rowH = layout().rowH
+        let w = max(72, (d.options.map { UI.width($0, font) }.max() ?? 0) + padX * 2 + 2)
+        let h = rowH * CGFloat(d.options.count) + 6
+        var x = bounds.width - 4 - w, y: CGFloat
+        if let a = d.anchor {                    // 行的右键菜单：出现在鼠标点的地方
+            x = min(max(a.x, 4), bounds.width - 4 - w); y = a.y
+        } else {
+            let L = pageLayout()
+            guard d.row < L.rows.count else { return (.zero, []) }
+            y = L.rows[d.row].maxY + 1
+        }
+        if y + h > bounds.height - 3 { y = bounds.height - 3 - h }       // 下面放不下就往上顶，始终留在小窗里
+        y = max(3, y)
+        let box = NSRect(x: x, y: y, width: w, height: h)
+        return (box, d.options.indices.map { NSRect(x: box.minX, y: box.minY + 3 + CGFloat($0) * rowH, width: w, height: rowH) })
+    }
+    private func drawDropdown() {
+        guard let d = dropdown else { return }
+        let g = dropGeometry()
+        let path = NSBezierPath(roundedRect: g.box, xRadius: 5, yRadius: 5)
+        (cfg.theme == "light" ? NSColor(white: 0.94, alpha: 0.99) : NSColor(white: 0.17, alpha: 0.99)).setFill(); path.fill()
+        dimColor.withAlphaComponent(0.35).setStroke(); path.lineWidth = 0.5; path.stroke()
+        for (i, r) in g.rows.enumerated() {
+            if i == dropSel {
+                textColor.withAlphaComponent(0.16).setFill()
+                NSBezierPath(roundedRect: r.insetBy(dx: 3, dy: 0), xRadius: 3, yRadius: 3).fill()
+            }
+            (d.options[i] as NSString).draw(at: NSPoint(x: r.minX + padX, y: r.minY), withAttributes: [.font: font, .foregroundColor: i == d.current ? textColor : dimColor])
+        }
+    }
+    var onArrow: ((Int) -> Void)?       // 列表页按了 ↑(-1) / ↓(+1)
+    var keyNav = false                  // 菜单 / 设置页里用过方向键：显示键盘选中的那一行
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if let d = dropdown {        // 下拉列表开着：方向键在选项里移动
+            switch event.keyCode {
+            case 125: dropSel = (dropSel + 1) % d.options.count; needsDisplay = true
+            case 126: dropSel = (dropSel + d.options.count - 1) % d.options.count; needsDisplay = true
+            case 36, 76, 49: dropdown = nil; d.pick(dropSel)
+            case 53: dropdown = nil
+            default: break
+            }
+            return
+        }
+        let live = pageRows.filter { $0.action != nil }.count
+        switch (event.keyCode, page) {
+        case (125, .list): onArrow?(1)
+        case (126, .list): onArrow?(-1)
+        case (53, .list): onClickRow?(nil)                    // Esc：收起详情
+        case (24, .list), (69, .list): keyZoom(0.6)           // = / +：放大走势图
+        case (27, .list), (78, .list): keyZoom(1 / 0.6)       // -：缩小
+        case (123, .list): keyPan(-1)                         // ← →：放大后左右挪
+        case (124, .list): keyPan(1)
+        case (29, .list): resetZoom()                         // 0：回到全天
+        case (51, .list), (117, .list): if detail != nil { onRemove?() }     // 删除键：移除正在看的这只
+        case (125, _): if live > 0 { keySel = keyNav ? (keySel + 1) % live : 0; keyNav = true; needsDisplay = true }
+        case (126, _): if live > 0 { keySel = keyNav ? (keySel + live - 1) % live : live - 1; keyNav = true; needsDisplay = true }
+        case (36, _), (76, _), (49, _): if keyNav, let i = keyRow { pageRows[i].action?() }     // 回车 / 空格：执行选中的那一行
+        case (53, _): onBack?()
+        default: super.keyDown(with: event)
+        }
+    }
+    var onMenu: (() -> Void)?
+    var onSearch: ((String) -> Void)?
+    let searchField = NSTextField()
+    private var hoverPRow: Int?
+    private var hoverNav: Int?
+    private var hoverBack = false
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        searchField.isBordered = false; searchField.drawsBackground = false; searchField.focusRingType = .none
+        searchField.cell?.usesSingleLineMode = true; searchField.cell?.isScrollable = true
+        searchField.delegate = self
+        searchField.isHidden = true
+        addSubview(searchField)
+        allowedTouchTypes = [.indirect]            // 接收触控板上手指的原始位置
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func ink(_ dir: Int) -> NSColor { color(for: dir) }       // 给外面画图例用
+    var inkText: NSColor { textColor }
+    var inkDim: NSColor { dimColor }
+
+    var rows: [Row] = [] { didSet { layoutCache = nil } }
+    var cfg = Config() { didSet { layoutCache = nil } }
+    var detail: Detail?
+    var selectedRow: Int?
+    private var layoutCache: (widths: [CGFloat], gaps: [CGFloat], rowH: CGFloat)?
+    var onHoverRow: ((Int?) -> Void)?   // 鼠标指到某一行：提前把它的分时数据拉好
+    var status = ""                     // 标题条左侧：更新时间 / 断线 / 配置有误
+    var expanded = false
+    var mini = false                    // 收成一个笑脸
+    var onHover: ((Bool) -> Void)?
+    var onClickRow: ((Int?) -> Void)?
+    var onToggleExpand: (() -> Void)?
+    var onToggleMini: (() -> Void)?
+    var onClose: (() -> Void)?
+    var onAdd: (() -> Void)?
+    var onContextMenu: ((Int?) -> Void)?
+    var tabs: [String] = []             // 顶部的市场标签（只有一个市场时不显示）
+    var tabIndex = 0
+    var onSelectTab: ((Int) -> Void)?
+    var greenUp = false                 // 这一页是不是绿涨红跌（美股页）
+    private var hoverTab: Int?
+    var showMore = false                // 详情里是否展开「更多」指标
+    var onToggleMore: (() -> Void)?
+    private var hint: String?           // 鼠标指着某个指标时，标题行显示的解释
+    private var hoverToggle = false
+    var onChartHover: ((Bool) -> Void)?       // 鼠标进了 / 出了走势图
+    private var overChart = false
+    var onRemove: (() -> Void)?
+    var onReorder: ((Int, Int) -> Void)?     // 把第几行拖到了第几行
+    private var dragFrom: Int?
+    private var dragTo: Int?                 // 松手后插到第几行前面
+    private var tipReady = false        // 鼠标在同一行停够了时间，可以显示全名
+    private var tipTimer: Timer?
+    var debugRow: Int?                  // 调试用：固定显示某一行的悬停效果，不被真实鼠标冲掉
+    func debugHover(row: Int) { debugRow = row; hoverRow = row; tipReady = true; needsDisplay = true }
+    private var scrollY: CGFloat = 0    // 列表滚动了多少像素
+
+    private let padX: CGFloat = 8, padY: CGFloat = 5, gap: CGFloat = 10
+    private let headerTop: CGFloat = 5  // 标题条上方留白
+    private let headerH: CGFloat = 16   // 顶部标题条：左边市场标签，右边四个按钮
+    private let headerGap: CGFloat = 6  // 标题条和列表之间的空隙
+    private let btnW: CGFloat = 18
+    private let volH: CGFloat = 16      // 成交量柱的高度
+    private let axisH: CGFloat = 11     // 时间刻度那一行
+    private var zoom: (lo: Double, hi: Double)?   // 走势图当前显示的分钟范围，nil = 全天
+    private var hoverSlot: Int?         // 鼠标在走势图上指着第几分钟
+    private var resetRect = NSRect.zero
+    private let sparkH: CGFloat = 46, pairGap: CGFloat = 8, colGap: CGFloat = 16
+    let miniSize: CGFloat = 38
+    var detailAlpha: CGFloat = 1        // 详情区的透明度，过渡动画用
+    var pose = Pose()                   // 啦啦队员现在的姿势
+    var zFade: CGFloat = 1              // 睡着时 z 的淡入程度
+    var facing = false                  // 鼠标停在它身上：转过来面对你，脚尖朝前
+    var gaze = NSPoint.zero             // 眼睛往哪边看（-1…1）：鼠标停在它身上时看向鼠标
+    private var stableW: [Bool: CGFloat] = [:]   // 每种模式用过的最大宽度，只增不减，避免数字位数变化时抖动
+    private var stableSig = ""
+    private var hoverRow: Int?          // 鼠标所在的行，用来高亮提示可点击
+    private var hoverBtn: Int?          // 鼠标指着第几个按钮
+    private var downAt: NSPoint?
+    private var dragging = false
+    private var fitCache: [String: String] = [:]
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private var listTop: CGFloat { headerTop + headerH + headerGap }
+    private var tabFont: NSFont { .monospacedDigitSystemFont(ofSize: max(CGFloat(cfg.fontSize) - 1, 8), weight: .regular) }
+    private var smallFont: NSFont { .monospacedDigitSystemFont(ofSize: max(CGFloat(cfg.fontSize) - 2.5, 7), weight: .regular) }
+
+    /// 按钮从左往右：添加、菜单、收成笑脸、隐藏
+    private let btnCount = 4
+    private func btnRect(_ i: Int) -> NSRect {
+        let right = bounds.width - 5
+        return NSRect(x: right - btnW * CGFloat(btnCount - i), y: headerTop, width: btnW, height: headerH)     // 等宽、等距
+    }
+    private func buttonAt(_ p: NSPoint) -> Int? { (0..<btnCount).first { btnRect($0).contains(p) } }
+    private func tabRect(_ i: Int) -> NSRect {
+        var x = padX - 5
+        for k in 0..<i { x += UI.width(tabs[k], tabFont) + 12 }
+        return NSRect(x: x, y: headerTop, width: UI.width(tabs[i], tabFont) + 12, height: headerH)
+    }
+    private func tabAt(_ p: NSPoint) -> Int? { tabs.count > 1 ? tabs.indices.first { tabRect($0).contains(p) } : nil }
+    private var btnTips: [String] { [T("添加", "Add"), T("设置", "Settings"), T("收起", "Shrink"), T("隐藏 ⌃⌥S", "Hide ⌃⌥S")] }
+
+    // 列表：最多显示 maxVisibleRows 行，多的滚动
+    private var visibleRows: Int { max(1, min(rows.count, cfg.maxVisibleRows)) }
+    private func listHeight(_ rowH: CGFloat) -> CGFloat { rowH * CGFloat(visibleRows) }
+    private func maxScroll(_ rowH: CGFloat) -> CGFloat { max(0, rowH * CGFloat(rows.count) - listHeight(rowH)) }
+    private func listRect() -> NSRect { NSRect(x: 0, y: listTop, width: bounds.width, height: listHeight(layout().rowH)) }
+    private func rowAt(_ p: NSPoint) -> Int? {
+        guard listRect().contains(p) else { return nil }
+        let i = Int(floor((p.y - listTop + scrollY) / layout().rowH))
+        return (0..<rows.count).contains(i) ? i : nil
+    }
+    /// 把某一行滚到看得见的位置
+    func reveal(row: Int) {
+        let rowH = layout().rowH
+        let top = CGFloat(row) * rowH
+        if top < scrollY { scrollY = top }
+        if top + rowH > scrollY + listHeight(rowH) { scrollY = top + rowH - listHeight(rowH) }
+        scrollY = min(max(0, scrollY), maxScroll(rowH))
+        needsDisplay = true
+    }
+
+    // 自己区分「拖动」和「点击」：移动超过 3px 算拖窗口，否则算点击
+    override func mouseDown(with event: NSEvent) {
+        downAt = event.locationInWindow; dragging = false
+        dragFrom = (page == .list && !mini && dropdown == nil) ? rowAt(convert(event.locationInWindow, from: nil)) : nil
+        dragTo = nil
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let d = downAt else { return }
+        let p = event.locationInWindow
+        if !dragging, abs(p.x - d.x) <= 3, abs(p.y - d.y) <= 3 { return }
+        if dragFrom != nil, rows.count > 1 {          // 在列表里拖：调整顺序
+            dragging = true
+            let y = convert(p, from: nil).y
+            let t = Int(((y - listTop + scrollY) / layout().rowH).rounded())
+            let clamped = min(max(t, 0), rows.count)
+            if clamped != dragTo { dragTo = clamped; needsDisplay = true }
+            return
+        }
+        if !dragging { dragging = true; window?.performDrag(with: event) }
+    }
+    override func mouseUp(with event: NSEvent) {
+        defer { downAt = nil }
+        if let from = dragFrom, let to = dragTo, dragging {
+            dragFrom = nil; dragTo = nil; needsDisplay = true
+            if to != from, to != from + 1 { onReorder?(from, to > from ? to - 1 : to) }
+            return
+        }
+        dragFrom = nil; dragTo = nil
+        guard downAt != nil, !dragging else { return }
+        if mini { onToggleMini?(); return }
+        let p = convert(event.locationInWindow, from: nil)
+        if let d = dropdown {         // 下拉列表开着：点选项就选，点别处就收起
+            let i = dropGeometry().rows.firstIndex { $0.contains(p) }
+            dropdown = nil
+            if let i = i { d.pick(i) }
+            return
+        }
+        if page != .list {
+            if p.y < listTop {
+                if let a = pageAction, btnRect(btnCount - 2).contains(p) { a.action() }
+                else if backRect.contains(p) || btnRect(btnCount - 1).contains(p) { onBack?() }
+                return
+            }
+            let L = pageLayout()
+            if let i = L.nav.firstIndex(where: { $0.contains(p) }) { pageNav[i].1(); return }
+            if let i = L.rows.firstIndex(where: { $0.contains(p) }), let a = pageRows[i].action { a() }
+            return
+        }
+        if let b = buttonAt(p) {
+            [onAdd, onMenu, onToggleMini, onClose][b]?()
+            return
+        }
+        if let t = tabAt(p) { if t != tabIndex { onSelectTab?(t) }; return }
+        if p.y < listTop { return }                       // 标题条空白处：只用来拖动
+        if let L = detailLayout() {
+            if L.all.insetBy(dx: 0, dy: -3).contains(p) {
+                if zoom != nil, resetRect.contains(p) { resetZoom() }
+                else if event.clickCount == 2 { toggleZoom() }
+                return
+            }
+            if let t = L.toggle, t.contains(p) { onToggleMore?(); return }
+        }
+        if let i = rowAt(p) {
+            if event.clickCount >= 2 { return }           // 双击不当成「开了又关」
+            onClickRow?(i)                                // 再点一次已展开的那一行就是收起
+        }
+    }
+
+    /// 文字太长就截断加省略号，保证不把小窗撑宽
+    private func fit(_ s: String, maxW: CGFloat) -> String {
+        let key = "\(s)|\(maxW)|\(cfg.fontSize)"
+        if let c = fitCache[key] { return c }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var out = s
+        if (s as NSString).size(withAttributes: attrs).width > maxW {
+            var chars = Array(s)
+            while chars.count > 1, ((String(chars) + "…") as NSString).size(withAttributes: attrs).width > maxW { chars.removeLast() }
+            out = String(chars) + "…"
+        }
+        if fitCache.count > 200 { fitCache.removeAll() }
+        fitCache[key] = out
+        return out
+    }
+    private var maxLabelW: CGFloat { CGFloat(cfg.fontSize) * 7 }
+    private func cellText(_ c: Cell, _ ci: Int) -> String { ci == 0 && !c.whole ? fit(c.text, maxW: maxLabelW) : c.text }
+
+    private var dimColor: NSColor { textColor.withAlphaComponent(0.55) }
+
+    private var font: NSFont { .monospacedDigitSystemFont(ofSize: CGFloat(cfg.fontSize), weight: .regular) }
+
+    private var textColor: NSColor {
+        switch cfg.theme {
+        case "light": return NSColor(white: 0.15, alpha: 1)
+        case "none": return NSColor(white: 0.5, alpha: 1)
+        default: return NSColor(white: 0.88, alpha: 1)
+        }
+    }
+
+    private func color(for d: Int) -> NSColor {
+        guard cfg.color, d != 0 else { return textColor }
+        let dir = greenUp ? -d : d
+        return dir > 0 ? NSColor(red: 0.85, green: 0.42, blue: 0.40, alpha: 1)
+                       : NSColor(red: 0.40, green: 0.70, blue: 0.50, alpha: 1)
+    }
+
+    private func layout() -> (widths: [CGFloat], gaps: [CGFloat], rowH: CGFloat) {
+        if let c = layoutCache { return c }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var widths: [CGFloat] = [], gaps: [CGFloat] = []
+        for r in rows {
+            for (i, c) in r.cells.enumerated() {
+                let w = ceil((cellText(c, i) as NSString).size(withAttributes: attrs).width)
+                if i >= widths.count {
+                    widths.append(w)
+                    gaps.append(c.dim && !c.right ? 4 : gap)   // 「开」「高」这类小标签紧贴后面的数值
+                } else { widths[i] = max(widths[i], w) }
+            }
+        }
+        let r = (widths, gaps, ceil(font.ascender - font.descender + font.leading) + 3)
+        layoutCache = r
+        return r
+    }
+
+    private func naturalListWidth(_ widths: [CGFloat], _ gaps: [CGFloat]) -> CGFloat {
+        widths.reduce(0, +) + gaps.dropLast().reduce(0, +) + padX * 2
+    }
+
+    /// 详情区里每一块的位置。画图、算高度、判断鼠标指着什么，都用这一份，保证三者一致
+    private struct DL {
+        var titleY: CGFloat = 0
+        var spark = NSRect.zero, vol = NSRect.zero, all = NSRect.zero
+        var range: NSRect?
+        var flow: NSRect?
+        var stats: [(rect: NSRect, stat: Stat)] = []
+        var toggle: NSRect?
+        var bottom: CGFloat = 0
+    }
+    private func detailLayout(width: CGFloat? = nil) -> DL? {
+        guard let d = detail, !mini else { return nil }
+        let rowH = layout().rowH
+        let cw = (width ?? bounds.width) - padX * 2
+        var L = DL()
+        var y = listTop + listHeight(rowH) + 7
+        L.titleY = y; y += rowH
+        L.spark = NSRect(x: padX, y: y, width: cw, height: sparkH)
+        L.vol = NSRect(x: padX, y: L.spark.maxY + 4, width: cw, height: volH)
+        L.all = L.spark.union(L.vol)
+        y = L.vol.maxY + 2 + axisH + 5
+        if d.high > d.low, d.low > 0 { L.range = NSRect(x: padX, y: y, width: cw, height: rowH); y += rowH }
+        if d.buy + d.sell > 0 { L.flow = NSRect(x: padX, y: y, width: cw, height: rowH); y += rowH }
+        y += 2
+        let colW = (cw - colGap) / 2
+        func grid(_ stats: [Stat]) {
+            for (i, st) in stats.enumerated() {
+                L.stats.append((NSRect(x: padX + CGFloat(i % 2) * (colW + colGap), y: y + CGFloat(i / 2) * rowH, width: colW, height: rowH), st))
+            }
+            y += rowH * CGFloat((stats.count + 1) / 2)
+        }
+        grid(d.core)
+        if !d.more.isEmpty {
+            if showMore { grid(d.more) }
+            L.toggle = NSRect(x: padX, y: y, width: cw, height: 12)      // 底部居中的小箭头，像抽屉把手
+            y += 12
+            L.bottom = y + 2
+        } else {
+            L.bottom = y + padY
+        }
+        return L
+    }
+
+    /// 小窗应有的大小。宽度在同一种模式下固定：列表和详情共用一个宽度，切换股票不会变宽变窄
+    func size(withDetail: Bool) -> NSSize {
+        if mini { let m: CGFloat = cfg.miniStyle == "face" ? miniSize : (["s": 52, "l": 88][cfg.mascotSize] ?? 68); return NSSize(width: m, height: m) }
+        if page != .list {
+            let w = max(ceil(CGFloat(cfg.fontSize) * 21), stableW[false] ?? 0)
+            return NSSize(width: w, height: pageLayout(width: w).bottom)
+        }
+        let (widths, gaps, rowH) = layout()
+        let sig = cfg.stocks.joined(separator: ",") + "|\(cfg.fontSize)|\(cfg.label)"
+        if sig != stableSig { stableSig = sig; stableW = [:] }
+        let w = max(naturalListWidth(widths, gaps), ceil(CGFloat(cfg.fontSize) * 21), stableW[expanded] ?? 0)
+        stableW[expanded] = w
+        scrollY = min(scrollY, maxScroll(rowH))
+        var h = listTop + listHeight(rowH) + padY
+        if withDetail, let L = detailLayout(width: w) { h = L.bottom }
+        return NSSize(width: w, height: h)
+    }
+
+    // MARK: 页面（添加 / 菜单 / 引导）
+
+    private var backRect: NSRect { NSRect(x: 0, y: headerTop, width: padX + 12 + UI.width(pageTitle, tabFont) + 8, height: headerH) }
+    private func textH(_ t: String, _ w: CGFloat, _ f: NSFont) -> CGFloat {
+        ceil((t as NSString).boundingRect(with: NSSize(width: w, height: 1000), options: [.usesLineFragmentOrigin], attributes: [.font: f]).height)
+    }
+    private struct PL { var field = NSRect.zero; var rows: [NSRect] = []; var footY: CGFloat = 0; var nav: [NSRect] = []; var bottom: CGFloat = 0 }
+    private func pageLayout(width: CGFloat? = nil) -> PL {
+        let rowH = layout().rowH
+        let W = width ?? bounds.width, cw = W - padX * 2
+        var L = PL()
+        var y = listTop
+        if page == .add { L.field = NSRect(x: padX, y: y, width: cw, height: rowH + 2); y += rowH + 2 + 5 }
+        for r in pageRows {
+            var h = rowH
+            if r.sep { h = 7 }
+            else if r.wrap { h = max(textH(r.text, cw - (r.art != nil ? 40 : 0), font) + 5, r.art != nil ? 26 : 0) }
+            L.rows.append(NSRect(x: 0, y: y, width: W, height: h)); y += h
+        }
+        if pageRows.count < pageMinRows { y += rowH * CGFloat(pageMinRows - pageRows.count) }
+        if !pageFoot.isEmpty || !pageNav.isEmpty || pageDots != nil {
+            y += 5; L.footY = y
+            var x = W - padX + 5
+            for (t, _) in pageNav.reversed() {
+                let w = UI.width(t, tabFont) + 12
+                x -= w
+                L.nav.insert(NSRect(x: x, y: y, width: w, height: rowH + 2), at: 0)
+                x -= 2
+            }
+            y += rowH + 2
+        }
+        L.bottom = y + padY
+        return L
+    }
+    /// 可点的行里第 keySel 个，对应 pageRows 的下标
+    private var keyRow: Int? {
+        let live = pageRows.indices.filter { pageRows[$0].action != nil }
+        return live.isEmpty ? nil : live[min(max(keySel, 0), live.count - 1)]
+    }
+
+    private func drawPage() {
+        let rowH = layout().rowH
+        let L = pageLayout()
+        let headMid = headerTop + headerH / 2
+        // 标题条：左边「‹ 页面名」点一下返回，右边一个 × 也是返回
+        let back = NSBezierPath(); let bx = padX + 3
+        back.move(to: NSPoint(x: bx + 2, y: headMid - 3.5)); back.line(to: NSPoint(x: bx - 2, y: headMid)); back.line(to: NSPoint(x: bx + 2, y: headMid + 3.5))
+        back.lineWidth = 1.2; back.lineCapStyle = .round; back.lineJoinStyle = .round
+        (hoverBack ? textColor : dimColor).setStroke(); back.stroke()
+        (pageTitle as NSString).draw(at: NSPoint(x: padX + 12, y: headMid - (tabFont.ascender - tabFont.descender) / 2 - 0.5),
+                                     withAttributes: [.font: tabFont, .foregroundColor: textColor])
+        if let a = pageAction {           // 恢复默认：一个转回去的箭头；指着它或等确认时，左边显示一句话
+            let r = btnRect(btnCount - 2), on = hoverBtn == btnCount - 2 || a.armed
+            if on { textColor.withAlphaComponent(a.armed ? 0.24 : 0.16).setFill(); NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 0), xRadius: 4, yRadius: 4).fill() }
+            let c = NSPoint(x: r.midX, y: headMid + 0.3), rad: CGFloat = 3.5
+            // 逆时针回转的箭头：从正上方出发，经右、下、左绕大半圈，停在左上方，末端的箭头指回顶部
+            let arc = NSBezierPath()
+            func ap(_ deg: CGFloat) -> NSPoint { NSPoint(x: c.x - rad * cos(deg * .pi / 180), y: c.y + rad * sin(deg * .pi / 180)) }   // 水平镜像，所以是逆时针
+            var first = true
+            for d in stride(from: CGFloat(-60), through: 215, by: 11) { first ? arc.move(to: ap(d)) : arc.line(to: ap(d)); first = false }
+            let tip = ap(-60)                                    // 箭头画在起点：缺口右边，指向缺口
+            arc.move(to: NSPoint(x: tip.x + 2.7, y: tip.y - 0.2)); arc.line(to: tip); arc.line(to: NSPoint(x: tip.x + 0.3, y: tip.y + 2.7))
+            arc.lineWidth = 1.2; arc.lineCapStyle = .round; arc.lineJoinStyle = .round
+            (on ? textColor : dimColor).setStroke(); arc.stroke()
+            if on {
+                let t = a.tip as NSString
+                let ta: [NSAttributedString.Key: Any] = [.font: smallFont, .foregroundColor: textColor.withAlphaComponent(0.85)]
+                let tw = t.size(withAttributes: ta).width
+                t.draw(at: NSPoint(x: r.minX - 5 - tw, y: headMid - (smallFont.ascender - smallFont.descender) / 2 - 0.5), withAttributes: ta)
+            }
+        }
+        let cr = btnRect(btnCount - 1)
+        if hoverBtn == btnCount - 1 { textColor.withAlphaComponent(0.16).setFill(); NSBezierPath(roundedRect: cr.insetBy(dx: 1, dy: 0), xRadius: 4, yRadius: 4).fill() }
+        let x = NSBezierPath(); let c = NSPoint(x: cr.midX, y: headMid), k: CGFloat = 3.5
+        x.move(to: NSPoint(x: c.x - k, y: c.y - k)); x.line(to: NSPoint(x: c.x + k, y: c.y + k))
+        x.move(to: NSPoint(x: c.x + k, y: c.y - k)); x.line(to: NSPoint(x: c.x - k, y: c.y + k))
+        x.lineWidth = 1.2; x.lineCapStyle = .round
+        (hoverBtn == btnCount - 1 ? textColor : dimColor).setStroke(); x.stroke()
+
+        // 搜索行：放大镜 + 输入框 + 底下一条细线，不另外套框
+        if page == .add {
+            let f = L.field
+            dimColor.setStroke()
+            let g = NSBezierPath(ovalIn: NSRect(x: f.minX + 1, y: f.midY - 4, width: 6.5, height: 6.5))
+            g.move(to: NSPoint(x: f.minX + 6.6, y: f.midY + 1.7)); g.line(to: NSPoint(x: f.minX + 9.2, y: f.midY + 4.3))
+            g.lineWidth = 1.1; g.lineCapStyle = .round; g.stroke()
+            dimColor.withAlphaComponent(0.35).setFill()
+            NSRect(x: f.minX, y: f.maxY + 1, width: f.width, height: 1).fill()
+        }
+        let kr = page == .add || keyNav ? keyRow : nil
+        for (i, r) in pageRows.enumerated() {
+            let rect = L.rows[i]
+            if r.sep {
+                dimColor.withAlphaComponent(0.3).setFill()
+                NSRect(x: padX, y: rect.midY, width: rect.width - padX * 2, height: 1).fill()
+                continue
+            }
+            if r.action != nil, hoverPRow == i || kr == i {
+                textColor.withAlphaComponent(hoverPRow == i ? 0.10 : 0.07).setFill()
+                NSBezierPath(roundedRect: NSRect(x: 3, y: rect.minY - (r.wrap ? 0 : 1), width: rect.width - 6, height: rect.height), xRadius: 3, yRadius: 3).fill()
+            }
+            var tx = padX + r.indent
+            if r.check == true {        // 选中的行：和列表里展开的那一行同一种底色
+                textColor.withAlphaComponent(0.18).setFill()
+                NSBezierPath(roundedRect: NSRect(x: 3, y: rect.minY - 1, width: rect.width - 6, height: rect.height), xRadius: 3, yRadius: 3).fill()
+            }
+            if let art = r.art { art(NSRect(x: tx, y: rect.minY + 3, width: 32, height: rect.height - 8)); tx += 40 }
+            let f: NSFont = r.bold ? .monospacedDigitSystemFont(ofSize: CGFloat(cfg.fontSize), weight: .semibold) : font
+            let col = r.dim ? dimColor : textColor
+            var rightW: CGFloat = 0
+            if !r.right.isEmpty {
+                let ra: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: r.rightAccent ? color(for: 1) : dimColor]
+                rightW = ceil((r.right as NSString).size(withAttributes: ra).width)
+                (r.right as NSString).draw(at: NSPoint(x: rect.maxX - padX - rightW, y: rect.minY), withAttributes: ra)
+                rightW += 8
+            }
+            let ps = NSMutableParagraphStyle()
+            ps.lineBreakMode = r.wrap ? .byWordWrapping : .byTruncatingTail
+            (r.text as NSString).draw(with: NSRect(x: tx, y: rect.minY, width: rect.maxX - padX - rightW - tx, height: rect.height),
+                                      options: [.usesLineFragmentOrigin], attributes: [.font: f, .foregroundColor: col, .paragraphStyle: ps])
+        }
+        // 底部：进度点 / 一句提示，右边是文字按钮
+        if L.footY > 0 {
+            let y = L.footY
+            dimColor.withAlphaComponent(0.3).setFill()
+            NSRect(x: padX, y: y - 2.5, width: bounds.width - padX * 2, height: 1).fill()
+            var fx = padX
+            if let (cur, total) = pageDots {
+                for i in 0..<total {
+                    textColor.withAlphaComponent(i == cur ? 0.9 : 0.25).setFill()
+                    NSBezierPath(ovalIn: NSRect(x: fx + CGFloat(i) * 8, y: y + (rowH + 2) / 2 - 2, width: 4, height: 4)).fill()
+                }
+                fx += CGFloat(total) * 8 + 4
+            }
+            let navLeft = L.nav.first?.minX ?? bounds.width - padX
+            if !pageFoot.isEmpty {
+                let ps = NSMutableParagraphStyle(); ps.lineBreakMode = .byTruncatingTail
+                (pageFoot as NSString).draw(in: NSRect(x: fx, y: y + 2.5, width: navLeft - fx - 4, height: rowH),
+                                            withAttributes: [.font: smallFont, .foregroundColor: pageFootAccent ? textColor : dimColor, .paragraphStyle: ps])
+            }
+            for (i, r) in L.nav.enumerated() {
+                let last = i == L.nav.count - 1
+                if hoverNav == i { textColor.withAlphaComponent(0.16).setFill(); NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 0), xRadius: 4, yRadius: 4).fill() }    // 和标题条按钮同款悬停底
+                let t = pageNav[i].0 as NSString
+                let a: [NSAttributedString.Key: Any] = [.font: tabFont, .foregroundColor: last || hoverNav == i ? textColor : dimColor]
+                t.draw(at: NSPoint(x: r.midX - t.size(withAttributes: a).width / 2, y: r.midY - (tabFont.ascender - tabFont.descender) / 2 - 0.5), withAttributes: a)
+            }
+        }
+        drawDropdown()
+    }
+
+    /// 进入 / 离开「添加」页时摆好输入框
+    func placeSearchField() {
+        searchField.isHidden = page != .add
+        guard page == .add else { return }
+        searchField.font = font; searchField.textColor = textColor
+        searchField.placeholderAttributedString = NSAttributedString(string: T("名称、拼音首字母或代码", "Name or ticker"),
+            attributes: [.font: font, .foregroundColor: textColor.withAlphaComponent(0.35)])
+        let f = pageLayout().field
+        let h = ceil(font.ascender - font.descender) + 3
+        searchField.frame = NSRect(x: f.minX + 13, y: f.minY + (f.height - h) / 2 + 0.5, width: f.width - 14, height: h)
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); placeSearchField() }
+
+    func controlTextDidChange(_ obj: Notification) { keySel = 0; onSearch?(searchField.stringValue) }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        let n = pageRows.filter { $0.action != nil }.count
+        switch sel {
+        case #selector(NSResponder.moveDown(_:)): if n > 0 { keySel = (keySel + 1) % n; needsDisplay = true }; return true
+        case #selector(NSResponder.moveUp(_:)): if n > 0 { keySel = (keySel + n - 1) % n; needsDisplay = true }; return true
+        case #selector(NSResponder.insertNewline(_:)): if let i = keyRow { pageRows[i].action?() }; return true
+        case #selector(NSResponder.cancelOperation(_:)): onBack?(); return true
+        default: return false
+        }
+    }
+
+    // MARK: 走势图
+
+    func resetZoom() { zoom = nil; hoverSlot = nil; hint = nil; needsDisplay = true }
+
+    private func chartGeometry() -> (spark: NSRect, vol: NSRect, all: NSRect)? {
+        detailLayout().map { ($0.spark, $0.vol, $0.all) }
+    }
+
+    private func totalSlots(_ d: Detail) -> Double { Double(max(d.sparkTotal, d.spark.count) - 1) }
+    private func visibleRange(_ d: Detail) -> (lo: Double, hi: Double) { zoom ?? (0, totalSlots(d)) }
+
+    /// 第 i 分钟对应的时间（分钟数）。有数据用数据里的，没有的（还没走到的时段）A 股按交易时间推算
+    private func slotMinutes(_ d: Detail, _ i: Int) -> Int? {
+        if i >= 0, i < d.times.count, d.times[i].count == 4, let v = Int(d.times[i]) { return v / 100 * 60 + v % 100 }
+        var k = i
+        for (a, b) in d.sessions where k >= 0 {
+            if k <= b - a { return a + k }
+            k -= b - a + 1
+        }
+        return nil
+    }
+    private func clock(_ m: Int) -> String { String(format: "%02d:%02d", m / 60, m % 60) }
+
+    private func zoomBy(_ factor: Double, atX x: CGFloat) {
+        guard let d = detail, let g = chartGeometry() else { return }
+        let total = totalSlots(d)
+        let (lo, hi) = visibleRange(d)
+        let span = hi - lo
+        let newSpan = min(max(span * factor, 10), total)          // 最多放大到 10 分钟
+        if factor >= 1, newSpan >= total - 0.5 { zoom = nil; needsDisplay = true; return }
+        if factor < 1, zoom == nil, total - newSpan < 0.01 { return }
+        let anchor = lo + Double((x - g.all.minX) / g.all.width) * span   // 以鼠标所在的时间点为中心
+        var nlo = anchor - (anchor - lo) * newSpan / span
+        nlo = min(max(nlo, 0), total - newSpan)
+        zoom = (nlo, nlo + newSpan)
+        needsDisplay = true
+    }
+
+    private func panBy(_ slots: Double) {
+        guard let d = detail, let z = zoom else { return }
+        let span = z.hi - z.lo
+        let nlo = min(max(z.lo + slots, 0), totalSlots(d) - span)
+        zoom = (nlo, nlo + span)
+        needsDisplay = true
+    }
+
+    /// 鼠标（屏幕坐标换成本视图坐标）是不是在走势图上
+    func chartPoint() -> NSPoint? {
+        guard let w = window, w.isVisible, page == .list, let g = chartGeometry() else { return nil }
+        let p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        return g.all.insetBy(dx: 0, dy: -3).contains(p) ? p : nil
+    }
+    /// 滚动缩放 / 平移。返回 true 表示这次滚动被走势图用掉了
+    func chartScroll(dx: Double, dy: Double, precise: Bool) -> Bool {
+        guard let p = chartPoint(), let d = detail, let g = chartGeometry() else { return false }
+        if abs(dy) >= abs(dx) {
+            zoomBy(exp(-dy * (precise ? 0.03 : 0.2)), atX: p.x)       // 上滑放大，下滑缩小
+        } else {
+            let (lo, hi) = visibleRange(d)
+            panBy(-dx * (precise ? 1 : 8) / Double(g.all.width) * (hi - lo))
+        }
+        return true
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        glog("scroll dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY) precise=\(event.hasPreciseScrollingDeltas) phase=\(event.phase.rawValue) onChart=\(chartGeometry().map { $0.all.insetBy(dx: 0, dy: -3).contains(convert(event.locationInWindow, from: nil)) } ?? false)")
+        if page != .list { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if !mini, listRect().contains(p), maxScroll(layout().rowH) > 0 {      // 在列表上滚动：翻看更多股票
+            let rowH = layout().rowH
+            let dy = event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 1 : rowH)
+            scrollY = min(max(scrollY - dy, 0), maxScroll(rowH))
+            needsDisplay = true
+            updateHover(event)
+            return
+        }
+        guard let g = chartGeometry(), let d = detail, g.all.insetBy(dx: 0, dy: -3).contains(p) else { super.scrollWheel(with: event); return }
+        _ = chartScroll(dx: Double(event.scrollingDeltaX), dy: Double(event.scrollingDeltaY), precise: event.hasPreciseScrollingDeltas)
+        updateHover(event)
+    }
+
+    /// 捏合手势没直接发到小窗时（小窗所在的应用不在前台），从全局监听转过来：鼠标在走势图上就缩放
+    func externalMagnify(_ magnification: CGFloat) {
+        glog("magnify(global) m=\(magnification)")
+        guard let w = window, page == .list else { return }
+        let p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        guard let g = chartGeometry(), g.all.insetBy(dx: 0, dy: -3).contains(p) else { return }
+        zoomBy(exp(-Double(magnification) * 1.6), atX: p.x)
+    }
+    /// 一键放大 / 恢复：全天时放大到鼠标附近的一小时，已放大则回到全天
+    func toggleZoom() {
+        if zoom != nil { resetZoom(); return }
+        guard let p = chartPoint(), let d = detail else { return }
+        zoomBy(60 / max(totalSlots(d), 60), atX: p.x)
+    }
+    /// 键盘缩放和平移：以图的中间为准
+    func keyZoom(_ factor: Double) { if let g = chartGeometry() { zoomBy(factor, atX: g.all.midX) } }
+    func keyPan(_ dir: Double) { if let d = detail { let (lo, hi) = visibleRange(d); panBy(dir * (hi - lo) * 0.25) } }
+
+    // 系统的捏合事件在这个小窗上收不到（日志里一次都没有），所以直接读触控板上手指的位置，自己算两指间距的变化
+    private var pinchDist: CGFloat?
+    private func twoFingerDistance(_ event: NSEvent) -> CGFloat? {
+        let ts = Array(event.touches(matching: .touching, in: self))
+        guard ts.count == 2 else { return nil }
+        let a = ts[0].normalizedPosition, b = ts[1].normalizedPosition
+        return hypot(a.x - b.x, a.y - b.y)
+    }
+    override func touchesBegan(with event: NSEvent) { pinchDist = twoFingerDistance(event) }
+    override func touchesEnded(with event: NSEvent) { pinchDist = twoFingerDistance(event) }
+    override func touchesCancelled(with event: NSEvent) { pinchDist = nil }
+    override func touchesMoved(with event: NSEvent) {
+        guard let d = twoFingerDistance(event) else { pinchDist = nil; return }
+        guard let last = pinchDist, last > 0.02, d > 0.02 else { pinchDist = d; return }
+        let ratio = last / d                       // 两指张开：间距变大，比值小于 1，放大
+        guard abs(ratio - 1) > 0.012, let p = chartPoint() else { return }     // 两指同向滑动时间距基本不变，不会误触发
+        pinchDist = d
+        glog(String(format: "pinch(touch) ratio=%.3f", ratio))
+        zoomBy(Double(pow(ratio, 1.6)), atX: p.x)
+        needsDisplay = true
+    }
+
+    override func magnify(with event: NSEvent) {
+        glog("magnify(view) m=\(event.magnification)")
+        let p = convert(event.locationInWindow, from: nil)
+        guard let g = chartGeometry(), g.all.insetBy(dx: 0, dy: -3).contains(p) else { return }
+        zoomBy(exp(-Double(event.magnification) * 1.6), atX: p.x)      // 张开放大，捏合缩小
+        updateHover(event)
+    }
+
+    private func drawDetail(_ d: Detail, rowH: CGFloat) {
+        guard let L = detailLayout() else { return }
+        let g = (spark: L.spark, vol: L.vol, all: L.all)
+        let contentW = bounds.width - padX * 2
+        let small = smallFont
+        dimColor.withAlphaComponent(0.3).setFill()
+        NSRect(x: padX, y: L.titleY - 4, width: contentW, height: 1).fill()
+
+        // 标题行有三种内容：鼠标在图上 → 那一分钟的时间 价格 涨跌幅；指着某个指标 → 大白话解释；平时 → 名称 代码 + 市场状态
+        let titleY = L.titleY
+        let tail = NSMutableParagraphStyle(); tail.lineBreakMode = .byTruncatingTail
+        if let hs = hoverSlot, hs < d.spark.count, d.prevClose > 0 {
+            (fit(d.name, maxW: contentW * 0.4) as NSString).draw(at: NSPoint(x: padX, y: titleY), withAttributes: [.font: font, .foregroundColor: dimColor])
+            let v = d.spark[hs], pct = (v - d.prevClose) / d.prevClose * 100
+            let t = slotMinutes(d, hs).map(clock) ?? ""
+            let txt = "\(t)  \(fmt(v))  " + String(format: "%+.2f%%", pct) as NSString
+            let a: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color(for: pct > 0.0001 ? 1 : (pct < -0.0001 ? -1 : 0))]
+            txt.draw(at: NSPoint(x: padX + contentW - txt.size(withAttributes: a).width, y: titleY), withAttributes: a)
+        } else if let h = hint {
+            (h as NSString).draw(in: NSRect(x: padX, y: titleY + 1.5, width: contentW, height: rowH),
+                                 withAttributes: [.font: small, .foregroundColor: textColor.withAlphaComponent(0.85), .paragraphStyle: tail])
+        } else {
+            let sa: [NSAttributedString.Key: Any] = [.font: small, .foregroundColor: d.live ? textColor.withAlphaComponent(0.85) : dimColor]
+            let sw = ceil((d.statusText as NSString).size(withAttributes: sa).width)
+            (d.statusText as NSString).draw(at: NSPoint(x: padX + contentW - sw, y: titleY + 1.5), withAttributes: sa)
+            if d.live {      // 正在交易：前面点一个小圆点
+                color(for: 1).withAlphaComponent(0.9).setFill()
+                NSBezierPath(ovalIn: NSRect(x: padX + contentW - sw - 8, y: titleY + rowH / 2 - 3.5, width: 4, height: 4)).fill()
+            }
+            let left = contentW - sw - 16
+            let nameW = min(ceil((d.name as NSString).size(withAttributes: [.font: font]).width), left * 0.62)
+            (d.name as NSString).draw(in: NSRect(x: padX, y: titleY, width: nameW, height: rowH),
+                                      withAttributes: [.font: font, .foregroundColor: textColor, .paragraphStyle: tail])
+            (d.code as NSString).draw(in: NSRect(x: padX + nameW + 6, y: titleY + 1.5, width: max(0, left - nameW - 6), height: rowH),
+                                      withAttributes: [.font: small, .foregroundColor: dimColor, .paragraphStyle: tail])
+        }
+
+        let (lo, hi) = visibleRange(d)
+        let span = max(hi - lo, 1)
+        func px(_ i: Double) -> CGFloat { g.all.minX + CGFloat((i - lo) / span) * g.all.width }
+
+        // 时间刻度：根据当前范围挑一个合适的间隔，图里画淡竖线，图下标时间
+        let interval = [5, 10, 15, 30, 60, 120].first { span / Double($0) <= 4.5 } ?? 120
+        let la: [NSAttributedString.Key: Any] = [.font: small, .foregroundColor: dimColor]
+        var lastMaxX = -CGFloat.infinity
+        for i in max(0, Int(ceil(lo)))...max(0, Int(floor(hi))) {
+            guard let m = slotMinutes(d, i), m % interval == 0 else { continue }
+            let x = px(Double(i))
+            dimColor.withAlphaComponent(0.16).setFill()
+            NSRect(x: x, y: g.spark.minY, width: 0.5, height: g.all.height).fill()
+            let label = clock(m) as NSString
+            let lw = label.size(withAttributes: la).width
+            let lx = min(max(x - lw / 2, g.all.minX), g.all.maxX - lw)
+            if lx > lastMaxX + 4 {
+                label.draw(at: NSPoint(x: lx, y: g.vol.maxY + 1), withAttributes: la)
+                lastMaxX = lx + lw
+            }
+        }
+
+        let i0 = max(0, Int(floor(lo))), i1 = min(d.spark.count - 1, Int(ceil(hi)))
+        if d.spark.count > 1, i0 <= i1 {
+            // 纵轴按可见区间撑满：放大后波形会跟着变大
+            let hasAvg = d.avg.count == d.spark.count
+            var vmin = d.spark[i0...i1].min()!, vmax = d.spark[i0...i1].max()!
+            if hasAvg { vmin = min(vmin, d.avg[i0...i1].min()!); vmax = max(vmax, d.avg[i0...i1].max()!) }
+            if zoom == nil, d.prevClose > 0 { vmin = min(vmin, d.prevClose); vmax = max(vmax, d.prevClose) }
+            if vmax - vmin < 0.0001 { vmax += 0.01; vmin -= 0.01 }
+            func py(_ v: Double) -> CGFloat { g.spark.maxY - 1 - CGFloat((v - vmin) / (vmax - vmin)) * (g.spark.height - 2) }
+
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: g.all).addClip()
+            if d.prevClose >= vmin, d.prevClose <= vmax {       // 昨收参考线
+                let base = NSBezierPath()
+                base.move(to: NSPoint(x: g.all.minX, y: py(d.prevClose))); base.line(to: NSPoint(x: g.all.maxX, y: py(d.prevClose)))
+                base.setLineDash([2, 3], count: 2, phase: 0); base.lineWidth = 0.5
+                dimColor.withAlphaComponent(0.4).setStroke(); base.stroke()
+            }
+            if hasAvg {          // 均价线：比价格线细、颜色偏黄，看盘软件的通行画法
+                let al = NSBezierPath()
+                for i in i0...i1 {
+                    let p = NSPoint(x: px(Double(i)), y: py(d.avg[i]))
+                    i == i0 ? al.move(to: p) : al.line(to: p)
+                }
+                al.lineWidth = 0.8; al.lineJoinStyle = .round
+                (cfg.color ? NSColor(red: 0.86, green: 0.72, blue: 0.36, alpha: 0.85) : dimColor).setStroke(); al.stroke()
+            }
+            let line = NSBezierPath()
+            for i in i0...i1 {
+                let p = NSPoint(x: px(Double(i)), y: py(d.spark[i]))
+                i == i0 ? line.move(to: p) : line.line(to: p)
+            }
+            line.lineWidth = 1; line.lineJoinStyle = .round
+            color(for: d.direction).withAlphaComponent(0.9).setStroke(); line.stroke()
+
+            // 分时成交量柱：这一分钟价格比上一分钟高（或持平）算涨色，低算跌色
+            if d.vols.count == d.spark.count, let vm = d.vols[i0...i1].max(), vm > 0 {
+                let bw = max(g.all.width / CGFloat(span + 1) - 0.4, 0.5)
+                for i in i0...i1 where d.vols[i] > 0 {
+                    let prev = i == 0 ? d.prevClose : d.spark[i - 1]
+                    let bh = max(CGFloat(d.vols[i] / vm) * g.vol.height, 0.5)
+                    color(for: d.spark[i] >= prev ? 1 : -1).withAlphaComponent(0.85).setFill()
+                    NSRect(x: px(Double(i)) - bw / 2, y: g.vol.maxY - bh, width: bw, height: bh).fill()
+                }
+            }
+            // 十字线
+            if let hs = hoverSlot, hs >= i0, hs <= i1 {
+                let x = px(Double(hs))
+                textColor.withAlphaComponent(0.45).setFill()
+                NSRect(x: x - 0.25, y: g.all.minY, width: 0.5, height: g.all.height).fill()
+                textColor.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x - 2, y: py(d.spark[hs]) - 2, width: 4, height: 4)).fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        if d.spark.count <= 1, let note = d.chartNote {
+            let ns = (note as NSString).size(withAttributes: la)
+            (note as NSString).draw(at: NSPoint(x: g.spark.midX - ns.width / 2, y: g.spark.midY - ns.height / 2), withAttributes: la)
+        }
+
+        // 放大后右上角出现「恢复」，点一下回到全天
+        if zoom != nil {
+            let txt = T("全天", "All day") as NSString
+            let a: [NSAttributedString.Key: Any] = [.font: small, .foregroundColor: textColor]
+            let ts = txt.size(withAttributes: a)
+            resetRect = NSRect(x: g.spark.maxX - ts.width - 8, y: g.spark.minY, width: ts.width + 8, height: ts.height + 3)
+            (cfg.theme == "light" ? NSColor(white: 0.85, alpha: 0.95) : NSColor(white: 0.28, alpha: 0.95)).setFill()
+            NSBezierPath(roundedRect: resetRect, xRadius: 3, yRadius: 3).fill()
+            txt.draw(at: NSPoint(x: resetRect.minX + 4, y: resetRect.minY + 1), withAttributes: a)
+        } else {
+            resetRect = .zero
+        }
+
+        // 今日区间条：横线 = 最低到最高，色块 = 开盘到现价（其实就是一根横着放的 K 线），小竖线 = 昨收
+        if let r = L.range {
+            let lt = T("低 ", "L ") as NSString, ht = T(" 高", " H") as NSString
+            let lv = fmt(d.low) as NSString, hv = fmt(d.high) as NSString
+            let da: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: dimColor]
+            let va: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: textColor]
+            var x = r.minX
+            lt.draw(at: NSPoint(x: x, y: r.minY), withAttributes: da); x += lt.size(withAttributes: da).width
+            lv.draw(at: NSPoint(x: x, y: r.minY), withAttributes: va); x += lv.size(withAttributes: va).width
+            let hvw = hv.size(withAttributes: va).width, htw = ht.size(withAttributes: da).width
+            hv.draw(at: NSPoint(x: r.maxX - htw - hvw, y: r.minY), withAttributes: va)
+            ht.draw(at: NSPoint(x: r.maxX - htw, y: r.minY), withAttributes: da)
+            let x0 = x + 9, x1 = r.maxX - htw - hvw - 9, cy = r.minY + rowH / 2 - 1
+            if x1 - x0 > 20 {
+                func bx(_ v: Double) -> CGFloat { x0 + CGFloat((min(max(v, d.low), d.high) - d.low) / (d.high - d.low)) * (x1 - x0) }
+                dimColor.withAlphaComponent(0.55).setFill()
+                NSRect(x: x0, y: cy - 0.5, width: x1 - x0, height: 1).fill()
+                if d.open > 0, d.price > 0 {
+                    let a = min(bx(d.open), bx(d.price)), b = max(bx(d.open), bx(d.price))
+                    color(for: d.direction).setFill()
+                    NSBezierPath(roundedRect: NSRect(x: a, y: cy - 2.5, width: max(b - a, 2), height: 5), xRadius: 1, yRadius: 1).fill()
+                }
+                if d.prevClose >= d.low, d.prevClose <= d.high {
+                    dimColor.setFill(); NSRect(x: bx(d.prevClose) - 0.5, y: cy - 5, width: 1, height: 10).fill()
+                }
+                if d.price > 0 { textColor.setFill(); NSBezierPath(ovalIn: NSRect(x: bx(d.price) - 2.5, y: cy - 2.5, width: 5, height: 5)).fill() }
+            }
+        }
+        // 买卖力道条：主动买 vs 主动卖
+        if let r = L.flow {
+            let total = d.buy + d.sell
+            let bt = String(format: T("买 %.0f%%", "Buy %.0f%%"), d.buy / total * 100) as NSString, st = String(format: T("%.0f%% 卖", "%.0f%% Sell"), d.sell / total * 100) as NSString
+            let ba: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color(for: 1)]
+            let sa2: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color(for: -1)]
+            bt.draw(at: NSPoint(x: r.minX, y: r.minY), withAttributes: ba)
+            let stw = st.size(withAttributes: sa2).width
+            st.draw(at: NSPoint(x: r.maxX - stw, y: r.minY), withAttributes: sa2)
+            let x0 = r.minX + bt.size(withAttributes: ba).width + 9, x1 = r.maxX - stw - 9, cy = r.minY + rowH / 2 - 1
+            if x1 - x0 > 20 {
+                let mid = x0 + (x1 - x0) * CGFloat(d.buy / total)
+                color(for: 1).withAlphaComponent(0.85).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x0, y: cy - 2, width: max(mid - x0 - 1, 1), height: 4), xRadius: 1.5, yRadius: 1.5).fill()
+                color(for: -1).withAlphaComponent(0.85).setFill()
+                NSBezierPath(roundedRect: NSRect(x: mid + 1, y: cy - 2, width: max(x1 - mid - 1, 1), height: 4), xRadius: 1.5, yRadius: 1.5).fill()
+            }
+        }
+        // 指标格子
+        for (r, st) in L.stats {
+            (st.label as NSString).draw(at: NSPoint(x: r.minX, y: r.minY), withAttributes: [.font: font, .foregroundColor: dimColor])
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: st.tint.map { color(for: $0) } ?? textColor]
+            let vw = (st.value as NSString).size(withAttributes: attrs).width
+            (st.value as NSString).draw(at: NSPoint(x: r.maxX - vw, y: r.minY), withAttributes: attrs)
+        }
+        // 底部小箭头：朝下 = 还有更多指标，朝上 = 收起
+        if let r = L.toggle {
+            if hoverToggle {
+                textColor.withAlphaComponent(0.10).setFill()
+                NSBezierPath(roundedRect: NSRect(x: r.midX - 16, y: r.minY, width: 32, height: r.height), xRadius: 4, yRadius: 4).fill()
+            }
+            let ch = NSBezierPath(); let cx = r.midX, cy = r.midY, sgn: CGFloat = showMore ? -1 : 1
+            ch.move(to: NSPoint(x: cx - 5, y: cy - sgn * 2)); ch.line(to: NSPoint(x: cx, y: cy + sgn * 2)); ch.line(to: NSPoint(x: cx + 5, y: cy - sgn * 2))
+            ch.lineWidth = 1.2; ch.lineCapStyle = .round; ch.lineJoinStyle = .round
+            (hoverToggle ? textColor : dimColor).setStroke(); ch.stroke()
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if mini, cfg.miniStyle != "face" { drawCheer(); return }      // 啦啦队员没有底色，像桌宠一样直接站在桌面上
+        if cfg.theme != "none" {
+            (cfg.theme == "light" ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0.08, alpha: 0.8)).setFill()
+            let r: CGFloat = mini ? miniSize / 2 : 7
+            NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
+        }
+        if mini { drawFace(); return }
+        if page != .list { drawPage(); return }
+        let (widths, gaps, rowH) = layout()
+
+        // 标题条：左边状态，右边 更多列 / 收成笑脸 / 退出
+        var sx = padX
+        let headMid = headerTop + headerH / 2
+        func baseline(_ f: NSFont) -> CGFloat { headMid - (f.ascender - f.descender) / 2 - 0.5 }      // 让文字和按钮图标对齐在同一条水平线上
+        if tabs.count > 1 {       // 市场标签：当前页亮一点，下面一条短线
+            for (i, t) in tabs.enumerated() {
+                let r = tabRect(i)
+                let on = i == tabIndex
+                let a: [NSAttributedString.Key: Any] = [.font: tabFont, .foregroundColor: on || hoverTab == i ? textColor : dimColor]
+                (t as NSString).draw(at: NSPoint(x: r.minX + 6, y: baseline(tabFont)), withAttributes: a)
+                if on { textColor.withAlphaComponent(0.8).setFill(); NSRect(x: r.minX + 6, y: r.maxY, width: r.width - 12, height: 1).fill() }
+                sx = r.maxX + 4
+            }
+        }
+        let statusW = btnRect(0).minX - sx - 6
+        if statusW > 20 {
+            let ps = NSMutableParagraphStyle(); ps.lineBreakMode = .byTruncatingTail
+            ps.alignment = tabs.count > 1 ? .right : .left
+            var a: [NSAttributedString.Key: Any] = [.font: smallFont, .foregroundColor: dimColor, .paragraphStyle: ps]
+            let r = NSRect(x: sx, y: baseline(smallFont), width: statusW, height: headerH)
+            if let b = hoverBtn { a[.foregroundColor] = textColor.withAlphaComponent(0.8); (btnTips[b] as NSString).draw(in: r, withAttributes: a) }
+            else { (status as NSString).draw(in: r, withAttributes: a) }
+        }
+        // 四个按钮：图标都画在同样大的 7×7 格子里，中心在同一条水平线上
+        for i in 0..<btnCount {
+            let r = btnRect(i)
+            if hoverBtn == i {
+                textColor.withAlphaComponent(0.16).setFill()
+                NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 0), xRadius: 4, yRadius: 4).fill()
+            }
+            (hoverBtn == i ? textColor : dimColor).setStroke()
+            let c = NSPoint(x: r.midX, y: headMid), k: CGFloat = 3.5
+            let path = NSBezierPath()
+            switch i {
+            case 0:     // 添加
+                path.move(to: NSPoint(x: c.x - k, y: c.y)); path.line(to: NSPoint(x: c.x + k, y: c.y))
+                path.move(to: NSPoint(x: c.x, y: c.y - k)); path.line(to: NSPoint(x: c.x, y: c.y + k))
+            case 1:     // 设置：两条滑杆，各带一个旋钮
+                for (dy, kx) in [(-2.2, 1.6), (2.2, -1.6)] as [(CGFloat, CGFloat)] {
+                    path.move(to: NSPoint(x: c.x - k - 0.5, y: c.y + dy)); path.line(to: NSPoint(x: c.x + kx - 1.5, y: c.y + dy))
+                    path.move(to: NSPoint(x: c.x + kx + 1.5, y: c.y + dy)); path.line(to: NSPoint(x: c.x + k + 0.5, y: c.y + dy))
+                    path.appendOval(in: NSRect(x: c.x + kx - 1.4, y: c.y + dy - 1.4, width: 2.8, height: 2.8))
+                }
+            case 2:     // 收起：两个朝中间收拢的箭头（右上一个、左下一个）
+                for sg in [1.0, -1.0] as [CGFloat] {
+                    let tip = NSPoint(x: c.x + sg * 0.9, y: c.y - sg * 0.9)
+                    path.move(to: NSPoint(x: c.x + sg * (k + 0.3), y: c.y - sg * (k + 0.3))); path.line(to: tip)
+                    path.move(to: NSPoint(x: tip.x, y: tip.y - sg * 2.6)); path.line(to: tip); path.line(to: NSPoint(x: tip.x + sg * 2.6, y: tip.y))
+                }
+            default:    // 隐藏
+                path.move(to: NSPoint(x: c.x - k, y: c.y - k)); path.line(to: NSPoint(x: c.x + k, y: c.y + k))
+                path.move(to: NSPoint(x: c.x + k, y: c.y - k)); path.line(to: NSPoint(x: c.x - k, y: c.y + k))
+            }
+            path.lineWidth = 1.2; path.lineCapStyle = .round; path.lineJoinStyle = .round
+            path.stroke()
+        }
+
+        if let d = detail, detailAlpha > 0.01, let ctx = NSGraphicsContext.current?.cgContext {
+            ctx.saveGState()
+            ctx.setAlpha(detailAlpha)
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+            drawDetail(d, rowH: rowH)
+            ctx.endTransparencyLayer()
+            ctx.restoreGState()
+        }
+
+        // 列表区：只画看得见的行，超出的靠滚动
+        let lr = NSRect(x: 0, y: listTop - 1, width: bounds.width, height: listHeight(rowH) + 2)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: lr).addClip()
+        func rowY(_ i: Int) -> CGFloat { listTop + CGFloat(i) * rowH - scrollY }
+        if let h = hoverRow, h < rows.count, !(detail != nil && h == selectedRow) {
+            textColor.withAlphaComponent(0.10).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 3, y: rowY(h) - 1, width: bounds.width - 6, height: rowH), xRadius: 3, yRadius: 3).fill()
+        }
+        if let s = selectedRow, detail != nil, s < rows.count {
+            textColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 3, y: rowY(s) - 1, width: bounds.width - 6, height: rowH), xRadius: 3, yRadius: 3).fill()
+        }
+        // 小窗比列表本身宽时，多出来的空隙放在名称和数值之间：名称贴左，数值贴右
+        let extra = max(0, bounds.width - naturalListWidth(widths, gaps))
+        for (ri, r) in rows.enumerated() {
+            let y = rowY(ri)
+            if y + rowH < lr.minY || y > lr.maxY { continue }
+            var x = padX
+            for (ci, c) in r.cells.enumerated() {
+                if ci == 1 { x += extra }
+                var col: NSColor = c.tint ? color(for: r.direction) : (c.dim ? dimColor : textColor)
+                if dragTo != nil, ri == dragFrom { col = col.withAlphaComponent(0.35) }
+                let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: col]
+                let text = cellText(c, ci) as NSString
+                let w = text.size(withAttributes: attrs).width
+                text.draw(at: NSPoint(x: x + (c.right ? widths[ci] - w : 0), y: y), withAttributes: attrs)
+                x += widths[ci] + gaps[ci]
+            }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        // 名称被省略的行：鼠标指着时，在它上面浮出全名
+        if tipReady, let h = hoverRow, h < rows.count, let c0 = rows[h].cells.first, !c0.whole, cellText(c0, 0) != c0.text {
+            let a: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: textColor]
+            let tw = min(ceil((c0.text as NSString).size(withAttributes: a).width), bounds.width - 20)
+            let ty = max(1, rowY(h) - rowH - 3)          // 统一浮在这一行的正上方；第一行则盖在标题条上
+            let box = NSRect(x: 4, y: ty, width: tw + 10, height: rowH + 2)
+            let bp = NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4)
+            (cfg.theme == "light" ? NSColor(white: 0.94, alpha: 0.99) : NSColor(white: 0.2, alpha: 0.99)).setFill(); bp.fill()
+            dimColor.withAlphaComponent(0.35).setStroke(); bp.lineWidth = 0.5; bp.stroke()
+            let ps = NSMutableParagraphStyle(); ps.lineBreakMode = .byTruncatingTail
+            var a2 = a; a2[.paragraphStyle] = ps
+            (c0.text as NSString).draw(in: NSRect(x: box.minX + 5, y: box.minY + 1, width: tw, height: rowH), withAttributes: a2)
+        }
+        // 拖动排序：一条横线标出松手后会落在哪
+        if let t = dragTo {
+            textColor.withAlphaComponent(0.9).setFill()
+            NSRect(x: 4, y: listTop + CGFloat(t) * rowH - scrollY - 1.5, width: bounds.width - 8, height: 2).fill()
+        }
+        drawDropdown()
+        // 滚动条：有更多行时在右边画一小段
+        let ms = maxScroll(rowH)
+        if ms > 0 {
+            let lh = listHeight(rowH)
+            let barH = max(10, lh * lh / (rowH * CGFloat(rows.count)))
+            textColor.withAlphaComponent(0.35).setFill()
+            NSBezierPath(roundedRect: NSRect(x: bounds.width - 3.5, y: listTop + (lh - barH) * scrollY / ms, width: 2, height: barH),
+                         xRadius: 1, yRadius: 1).fill()
+        }
+    }
+
+    /// 收起后的啦啦队员：和标题条图标同一套笔画的小符号（像终端里的 \o/）。
+    /// 没有底色，直接站在桌面上；线条外面有一圈很淡的反色描边，深色浅色桌面上都看得清。
+    private func drawCheer() { drawCheerPass(1) }
+
+    private func drawCheerPass(_ pass: Int) {
+        let u = min(bounds.width, bounds.height) / 38
+        let p = pose
+        let lift = min(p.hop, 0)                                       // 跳起来时整个人离地；下蹲时脚不动
+        func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * u, y: y * u) }
+        let light = false                              // 小人永远是白线加深色描边，不随浅色主题变黑
+        let ink = light ? NSColor(white: 0.12, alpha: 1) : NSColor(white: 0.93, alpha: 1)
+        // 描边是不透明的深灰：每个部件画自己的描边再画本体，前面的部件能完整压住后面的；
+        // 因为不透明，重叠的地方也不会叠出更深的颜色
+        let halo = NSColor(white: 0.17, alpha: 1)
+        let accent: NSColor
+        switch cfg.pomColor {
+        case "red": accent = NSColor(red: 0.90, green: 0.45, blue: 0.42, alpha: 1)
+        case "green": accent = NSColor(red: 0.42, green: 0.74, blue: 0.53, alpha: 1)
+        case "yellow": accent = NSColor(red: 0.90, green: 0.74, blue: 0.36, alpha: 1)
+        case "blue": accent = NSColor(red: 0.42, green: 0.62, blue: 0.95, alpha: 1)
+        case "white": accent = ink
+        default: accent = cfg.color ? color(for: 1) : ink          // 跟随当前这一页的涨色：A 股、港股红，美股绿
+        }
+        // 线宽不跟着大小等比放大：小号时线要相对粗一点才看得清，大号时相对细一点才不笨重
+        let sw = pow(u, 0.85)
+        func stroke(_ path: NSBezierPath, _ w: CGFloat, _ color: NSColor) {
+            path.lineCapStyle = .round; path.lineJoinStyle = .round
+            path.lineWidth = (w + 1.5) * sw; halo.setStroke(); path.stroke()
+            path.lineWidth = w * sw; color.setStroke(); path.stroke()
+        }
+        // 脚下一道短横线，像终端里的光标；人跳起来时它留在原地
+        let ground = NSBezierPath(); ground.move(to: pt(13.5, 33.4)); ground.line(to: pt(24.5, 33.4))
+        stroke(ground, 1.5, NSColor(white: 0.55, alpha: 1))
+
+        // 不穿衣服，就是线条小人。比例上躯干短、腿长：肩膀紧挨着头，胯在身体中间偏上，不会显得脖子一根到底
+        let hipY = 21.6 + p.hop, shoulder = pt(19 + p.lean, 17.4 + p.hop)
+        let body = NSBezierPath()
+        body.move(to: pt(19 + p.lean, 15.6 + p.hop)); body.line(to: pt(19, hipY))                 // 躯干
+        for (side, footLift) in [(-1.0, p.liftL), (1.0, p.liftR)] as [(CGFloat, CGFloat)] {
+            let ax = 19 + side * p.leg, ay = 30.4 + lift + footLift
+            let airborne = lift + footLift < -0.4          // 离地时脚尖往下压，落地时脚掌放平
+            // 脚尖默认朝前（画面里是斜着朝下的一小段）；只有两脚叉得很开的马步、大跳才朝外
+            let wide = p.leg > 5.0
+            let ft: CGFloat = airborne ? (wide ? 0.75 : 0.9) : (wide ? 0.6 : 1.0)
+            let fl: CGFloat = 1.7
+            body.move(to: pt(19, hipY)); body.line(to: pt(ax, ay))
+            body.line(to: pt(ax + side * cos(ft) * fl, ay + sin(ft) * fl))
+        }
+        stroke(body, 2.2, ink)                       // 最底下一层：躯干和腿
+        // 手臂和花球的路径先算好，等脑袋画完再画，这样举起来时手和花球在脑袋前面
+        var hands: [NSPoint] = []
+        let arms = NSBezierPath()
+        for (side, deg) in [(-1.0, p.aL), (1.0, p.aR)] as [(CGFloat, CGFloat)] {
+            let a = deg * .pi / 180
+            // 两个肩膀左右错开一点；手臂不是直棍，手肘处微微往下坠，越接近平举坠得越明显
+            let sh = NSPoint(x: shoulder.x + side * 1.0 * u, y: shoulder.y)
+            let h = NSPoint(x: sh.x + side * cos(a) * 11.0 * u, y: sh.y - sin(a) * 11.0 * u)
+            let sag = (0.5 + 1.7 * abs(cos(a))) * u
+            let elbow = NSPoint(x: (sh.x + h.x) / 2 + side * 0.5 * u * sin(a), y: (sh.y + h.y) / 2 + sag)
+            arms.move(to: sh); arms.curve(to: h, controlPoint1: elbow, controlPoint2: elbow)
+            hands.append(h)
+        }
+        let star = NSBezierPath()
+        for (i, h) in hands.enumerated() {
+            let dir: CGFloat = i == 0 ? -1 : 1
+            // 花球抛起来时在空中转；跳起来时也跟着转（spin）
+            let arc = 4 * p.toss * (1 - p.toss)                          // 0 → 1 → 0 的抛物线
+            let cx = h.x + dir * 1.0 * arc * u, cy = max(3.6 * u, h.y - 7 * arc * u)      // 抛得再高也留在画面里
+            for k in 0..<3 {
+                let a = (CGFloat(k) + (p.toss * 5 + p.spin) * dir) * .pi / 3
+                star.move(to: NSPoint(x: cx - cos(a) * 2.8 * u, y: cy - sin(a) * 2.8 * u))
+                star.line(to: NSPoint(x: cx + cos(a) * 2.8 * u, y: cy + sin(a) * 2.8 * u))
+            }
+        }
+
+        // 睡着时的 z：漫画里那种一串斜体小 z，从头边冒出来，越飘越高、越大，然后淡掉。线很细，不抢戏
+        if p.z > 0 {
+            for k in 0..<3 {
+                let t = (p.z + CGFloat(k) / 3).truncatingRemainder(dividingBy: 1)
+                let a = pow(sin(.pi * t), 1.6) * zFade                              // 淡入、淡出：刚冒出来和快消失的都很淡，不会糊成一团
+                let r = (0.45 + 0.8 * t) * u                                        // 越高越大
+                let cx = (19 + p.lean * 1.25 + 5.8 + 8.2 * t + 0.4 * sin(t * 2 * .pi)) * u    // 沿一条微微摆动的斜线往右上飘，三个 z 之间留出空隙
+                let cy = (10.4 + p.hop - 1.6 - 6.6 * t) * u
+                let sk = r * 0.35                                                   // 斜体：上横往右偏、下横往左偏
+                let zp = NSBezierPath()
+                zp.move(to: NSPoint(x: cx - r + sk, y: cy - r)); zp.line(to: NSPoint(x: cx + r + sk, y: cy - r))
+                zp.line(to: NSPoint(x: cx - r - sk, y: cy + r)); zp.line(to: NSPoint(x: cx + r - sk, y: cy + r))
+                zp.lineCapStyle = .round; zp.lineJoinStyle = .round
+                zp.lineWidth = 1.35 * sw; halo.withAlphaComponent(0.36 * a).setStroke(); zp.stroke()
+                zp.lineWidth = 0.65 * sw; ink.withAlphaComponent(a).setStroke(); zp.stroke()
+            }
+        }
+
+        // 脑袋：实心圆，五官用深色刻在上面
+        let hc = NSPoint(x: (19 + p.lean * 1.25) * u, y: (10.4 + p.hop) * u), hr = 5.4 * u
+        let head = NSBezierPath(ovalIn: NSRect(x: hc.x - hr, y: hc.y - hr, width: hr * 2, height: hr * 2))
+        head.lineWidth = 1.5 * sw; halo.setStroke(); head.stroke()
+        ink.setFill(); head.fill()
+        let feat = light ? NSColor(white: 0.97, alpha: 1) : NSColor(white: 0.10, alpha: 1)
+        feat.setStroke(); feat.setFill()
+        // 五官不是贴死在脸上的：身体往哪边倾，脸就往哪边看；跳起来时抬头，蹲下去时低头
+        let ox = p.lean * 0.55 + gaze.x * 0.75, oy = min(max(p.hop * 0.15, -0.4), 0.4) + gaze.y * 0.55
+        func fp(_ dx: CGFloat, _ dy: CGFloat) -> NSPoint { NSPoint(x: hc.x + (dx + ox) * u, y: hc.y + (dy + oy) * u) }
+        // 表情走丧萌路线：身体跳得很卖力，脸上没什么波澜
+        let f = NSBezierPath()
+        f.lineWidth = 1.05 * sw; f.lineCapStyle = .round; f.lineJoinStyle = .round
+        // 机器坏人式的豆豆眼：一道细细的平眉毛，眼睛是挂在眉毛下面的半颗豆子，两者连在一起；眉毛细、眼睛大
+        let ex: CGFloat = 2.35, ey: CGFloat = -2.3, my: CGFloat = 2.75
+        func lid(_ dx: CGFloat, _ half: CGFloat = 0.95, closed: Bool = true) {
+            let l = NSBezierPath()
+            if closed {       // 闭着的眼睛：比眉毛短，中间微微往下兜的一小段弧（‿），画得稍粗一点
+                l.move(to: fp(dx - half, ey + 0.1))
+                l.curve(to: fp(dx + half, ey + 0.1), controlPoint1: fp(dx - half * 0.5, ey + 0.55), controlPoint2: fp(dx + half * 0.5, ey + 0.55))
+                l.lineWidth = 0.95 * sw; l.lineCapStyle = .round; l.stroke()
+                return
+            }
+            l.move(to: fp(dx - half, ey)); l.line(to: fp(dx + half, ey))
+            l.lineWidth = 0.7 * sw; l.lineCapStyle = .round; l.stroke()
+        }
+        func halfEye(_ dx: CGFloat) {
+            lid(dx, 1.25, closed: false)                       // 眉毛
+            let e = NSBezierPath()
+            // 眼睛是一个圆，上面一小部分被眉毛遮住，露出大半个
+            e.move(to: fp(dx - 1.0, ey))
+            e.curve(to: fp(dx + 1.0, ey), controlPoint1: fp(dx - 1.1, ey + 2.05), controlPoint2: fp(dx + 1.1, ey + 2.05))
+            e.close(); e.fill()
+        }
+        func flatMouth(_ w: CGFloat) { f.move(to: fp(0.3 - w, my)); f.line(to: fp(0.3 + w, my)) }
+        switch p.face {
+        case 2:     // 用力：眼神不变，嘴张成一个小小的 o
+            halfEye(-ex); halfEye(ex)
+            f.stroke()
+            let o = NSBezierPath(ovalIn: NSRect(x: fp(0.3, my).x - 0.8 * u, y: fp(0.3, my).y - 0.58 * u, width: 1.6 * u, height: 1.16 * u))    // 线稿的小椭圆，不填实
+            o.lineWidth = 0.6 * sw; o.stroke()
+        case 4:     // 淡淡一笑：嘴是一小段往右上翘的弧
+            halfEye(-ex); halfEye(ex)
+            f.move(to: fp(-0.7, my + 0.25)); f.curve(to: fp(1.4, my - 0.35), controlPoint1: fp(0.0, my + 0.6), controlPoint2: fp(0.9, my + 0.35))
+            f.stroke()
+        case 0:     // 放松：眼睛闭上，只剩两道眼皮
+            lid(-ex); lid(ex); flatMouth(0.6)
+            f.stroke()
+        case 3:     // 偷看：一只眼闭着，一只半睁
+            lid(-ex); flatMouth(0.6)
+            halfEye(ex)
+            f.stroke()
+        default:    // 平时：半垂眼，嘴是一条短横线；偶尔眨一下
+            if p.blink { lid(-ex); lid(ex) } else { halfEye(-ex); halfEye(ex) }
+            flatMouth(0.85)
+            f.stroke()
+        }
+
+        // 最上面两层：手臂，然后花球
+        stroke(arms, 2.2, ink)
+        let patch = NSBezierPath()                 // 手臂的描边会在肩膀处横切过躯干，用一小段躯干本体盖回去
+        patch.move(to: pt(19 + p.lean, 16.6 + p.hop)); patch.line(to: pt(19 + p.lean * 0.6, 19.4 + p.hop))
+        patch.lineWidth = 2.2 * sw; patch.lineCapStyle = .round; ink.setStroke(); patch.stroke()
+        stroke(star, 2.0, accent)
+    }
+
+    /// 收起后的笑脸：嘴是一条往右上翘的线，末端带箭头，像一根上涨的走势
+    private func drawFace() {
+        let u = miniSize / 26
+        func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * u, y: y * u) }
+        textColor.setFill(); textColor.setStroke()
+        // 机器坏人的豆豆眼：一条水平的眼皮线，下面挂着半颗豆子。两只眼之间留足空隙
+        let ey: CGFloat = 8.4
+        for ex in [8.3, 16.3] as [CGFloat] {
+            let lid = NSBezierPath()
+            lid.move(to: pt(ex - 2.3, ey))
+            lid.line(to: pt(ex + 2.3, ey))
+            lid.lineWidth = 1.0 * u; lid.lineCapStyle = .round
+            lid.stroke()
+            let bean = NSBezierPath()
+            bean.move(to: pt(ex - 1.1, ey))
+            bean.curve(to: pt(ex + 1.5, ey), controlPoint1: pt(ex - 1.2, ey + 3.9), controlPoint2: pt(ex + 1.7, ey + 3.9))
+            bean.close()
+            bean.fill()
+        }
+        // 嘴：一条往右上翘的线，末端带箭头，整体压在下半张脸，不碰眼睛
+        (cfg.color ? NSColor(red: 0.85, green: 0.42, blue: 0.40, alpha: 1) : textColor).setStroke()
+        let tip = pt(19.4, 15.0)
+        let c2 = pt(15.6, 21.4)
+        let mouth = NSBezierPath()
+        mouth.move(to: pt(7.0, 16.4))
+        mouth.curve(to: tip, controlPoint1: pt(9.0, 21.4), controlPoint2: c2)
+        mouth.lineWidth = 1.5 * u; mouth.lineCapStyle = .round
+        mouth.stroke()
+        let ang = atan2(tip.y - c2.y, tip.x - c2.x)
+        let head = NSBezierPath()
+        head.move(to: NSPoint(x: tip.x - cos(ang - 0.7) * 3.3 * u, y: tip.y - sin(ang - 0.7) * 3.3 * u))
+        head.line(to: tip)
+        head.line(to: NSPoint(x: tip.x - cos(ang + 0.7) * 3.3 * u, y: tip.y - sin(ang + 0.7) * 3.3 * u))
+        head.lineWidth = 1.5 * u; head.lineCapStyle = .round; head.lineJoinStyle = .round
+        head.stroke()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    private func updateHover(_ event: NSEvent?) {
+        if dropdown != nil {
+            if let e = event, let i = dropGeometry().rows.firstIndex(where: { $0.contains(convert(e.locationInWindow, from: nil)) }), i != dropSel {
+                dropSel = i; needsDisplay = true
+            }
+            if hoverPRow != nil { hoverPRow = nil; needsDisplay = true }
+            return
+        }
+        if page != .list {
+            var pr: Int? = nil, nv: Int? = nil, bk = false, bt: Int? = nil
+            if let e = event {
+                let p = convert(e.locationInWindow, from: nil)
+                let L = pageLayout()
+                pr = L.rows.firstIndex { $0.contains(p) }.flatMap { pageRows[$0].action != nil ? $0 : nil }
+                nv = L.nav.firstIndex { $0.contains(p) }
+                bk = backRect.contains(p)
+                if btnRect(btnCount - 1).contains(p) { bt = btnCount - 1 }
+                if pageAction != nil, btnRect(btnCount - 2).contains(p) { bt = btnCount - 2 }
+            }
+            if pr != hoverPRow || nv != hoverNav || bk != hoverBack || bt != hoverBtn { hoverPRow = pr; hoverNav = nv; hoverBack = bk; hoverBtn = bt; needsDisplay = true }
+            return
+        }
+        var row: Int? = nil, btn: Int? = nil, slot: Int? = nil, tip: String? = nil, tog = false, tab: Int? = nil
+        if let e = event, !mini {
+            let p = convert(e.locationInWindow, from: nil)
+            if let g = chartGeometry(), let d = detail, g.all.contains(p), !d.spark.isEmpty, !resetRect.contains(p) {
+                let (lo, hi) = visibleRange(d)
+                let v = Int((lo + Double((p.x - g.all.minX) / g.all.width) * (hi - lo)).rounded())
+                if v >= 0, v < d.spark.count { slot = v }
+            }
+            btn = buttonAt(p)
+            tab = tabAt(p)
+            if btn == nil { row = rowAt(p) }
+            if let L = detailLayout() {       // 指着指标 / 区间条 / 买卖条：给一句解释
+                if let st = L.stats.first(where: { $0.rect.contains(p) }) { tip = gloss(st.stat.id) }
+                else if let r = L.range, r.contains(p) { tip = gloss("#range") }
+                else if let r = L.flow, r.contains(p) { tip = gloss("#flow") }
+                tog = L.toggle?.contains(p) ?? false
+            }
+        }
+        if tip != hint || tog != hoverToggle || tab != hoverTab { hint = tip; hoverToggle = tog; hoverTab = tab; needsDisplay = true }
+        let oc = event != nil && !mini && page == .list && chartPoint() != nil
+        if oc != overChart { overChart = oc; onChartHover?(oc) }
+        if let d = debugRow { row = d }
+        if row != hoverRow {            // 换了一行：全名提示先收起，在新的一行停 0.6 秒再出
+            tipTimer?.invalidate(); tipReady = false
+            if row != nil {
+                let t = Timer(timeInterval: 0.6, repeats: false) { [weak self] _ in self?.tipReady = true; self?.needsDisplay = true }
+                RunLoop.main.add(t, forMode: .common); tipTimer = t
+            }
+        }
+        if row != hoverRow { onHoverRow?(row) }
+        if row != hoverRow || btn != hoverBtn || slot != hoverSlot {
+            hoverRow = row; hoverBtn = btn; hoverSlot = slot; needsDisplay = true
+        }
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true); updateHover(event) }
+    override func mouseMoved(with event: NSEvent) { updateHover(event) }
+    override func mouseExited(with event: NSEvent) { updateHover(nil); onHover?(false) }
+    override func rightMouseDown(with event: NSEvent) {
+        if page != .list { onBack?(); return }
+        onContextMenu?(mini ? nil : rowAt(convert(event.locationInWindow, from: nil)))
+    }
+}
+
+// MARK: - 自绘浮层（菜单、添加面板）：和小窗一个风格，不用系统弹窗；还能跟着小窗一起不被截图
+
+enum UI {
+    static var theme = "dark"
+    static var fontSize: CGFloat = 11
+    static var color = true
+    static var text: NSColor { theme == "light" ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.90, alpha: 1) }
+    static var dim: NSColor { text.withAlphaComponent(0.5) }
+    static var bg: NSColor { theme == "light" ? NSColor(white: 0.98, alpha: 0.98) : NSColor(white: 0.09, alpha: 0.96) }
+
+    static var line: NSColor { text.withAlphaComponent(0.13) }
+    static var hl: NSColor { text.withAlphaComponent(0.13) }
+    static var field: NSColor { text.withAlphaComponent(0.08) }
+    static var accent: NSColor { color ? NSColor(red: 0.87, green: 0.45, blue: 0.42, alpha: 1) : text }
+    static func font(_ d: CGFloat = 0, _ w: NSFont.Weight = .regular) -> NSFont { .monospacedDigitSystemFont(ofSize: fontSize + d, weight: w) }
+    static func chrome(_ b: NSRect) {
+        let p = NSBezierPath(roundedRect: b.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
+        bg.setFill(); p.fill()
+        line.setStroke(); p.lineWidth = 1; p.stroke()
+    }
+    static func width(_ s: String, _ f: NSFont) -> CGFloat { ceil((s as NSString).size(withAttributes: [.font: f]).width) }
+}
+
+/// 小窗平时不抢键盘焦点；只有在「添加」页要打字时才允许成为键盘焦点
+final class KeyPanel: NSPanel {
+    var allowKey = false
+    override var canBecomeKey: Bool { allowKey }
+}
+
+/// 小窗里除了股票列表以外的页面：添加、菜单、引导。都画在同一块地方，用和列表一样的行
+enum Page { case list, add, menu, guide }
+
+struct PRow {
+    var text = ""
+    var right = ""             // 右侧淡色小字
+    var dim = false
+    var bold = false
+    var check: Bool? = nil     // 行首带一个勾选框
+    var sep = false            // 分隔线
+    var wrap = false           // 多行说明文字
+    var rightAccent = false
+    var indent: CGFloat = 0    // 缩进（展开的选项用）
+    var art: ((NSRect) -> Void)? = nil     // 行首的小图例
+    var action: (() -> Void)? = nil
+}
+
+// MARK: - 应用
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate?
+
+    var panel: NSPanel!
+    var board = BoardView()
+    var cfg = Config()
+    var configBad = false            // 配置文件格式有误（此时沿用上一份可用配置）
+    var configMTime: Date?
+    var cacheSavedAt = Date.distantPast
+    var quotes: [String: Quote] = [:]
+    var hovering = false
+    var failed = false
+    var everLoaded = false           // 至少成功拿到过一次行情
+    var lastOK: Date?
+    var lastFetchAt = Date.distantPast
+    var selected: String?            // 当前展开详情的那只（配置里的原始写法）
+    var minutes: [String: [Double]] = [:]
+    var minuteVols: [String: [Double]] = [:]
+    var minuteTimes: [String: [String]] = [:]
+    var minuteAvg: [String: [Double]] = [:]
+    var hoverFetch: DispatchWorkItem?
+    var blockedUntil: [String: Date] = [:]        // 哪个分时地址被拦截了、拦到什么时候
+    var detailMore = false           // 详情里「更多」是否展开
+    var minuteFetchedAt: [String: Date] = [:]
+    var autoCloseTimer: Timer?
+    var anchorRight: CGFloat = 0     // 小窗右上角钉在哪：按钮在右上角，变大变小时按钮不离开鼠标
+    var anchorTop: CGFloat = 0
+    var resizing = false
+    var animTimer: Timer?
+    var animTarget = NSRect.zero
+    var animAlphaTarget: CGFloat = 1
+    var animDone: (() -> Void)?
+    var closing = false              // 详情正在收起（内容要留到动画结束再清）
+    var lastDetailKey: String?
+    var mini = false                 // 收成笑脸
+    var expanded = false             // 是否显示开盘 / 最高 / 最低等更多列
+    var timer: Timer?
+    var statusItem: NSStatusItem?
+    var hotKeyRef: EventHotKeyRef?
+    var hotKeyOK = true
+    var lastHits: [SearchHit] = []   // 「添加」页当前的搜索结果
+    var adding = false               // 正在确认某只能不能加（防止连点加两次）
+    var borrowedFrom: NSRunningApplication?      // 为了接捏合手势临时切到前台时，原来在前台的是谁
+    var lastNearAt = 0.0             // 鼠标最后一次在拉拉队旁边是什么时候
+    var searchSeq = 0
+    var searchTimer: Timer?
+    var guideStep = 0
+    var guideMarkets: Set<String> = ["a"]
+    var guidePicked: [SearchHit] = []
+    var pageIdle: Timer?             // 菜单页没人碰时自己收回
+    var cheerTimer: Timer?           // 啦啦队动作的节拍
+    var cheerStart = CACurrentMediaTime()     // 这一轮动作从什么时候开始算
+    var cheerBlendFrom: Pose?        // 从哪个姿势过渡过来（进入 / 离开休息时用）
+    var cheerBlendStart = 0.0
+    var cheerResting = false
+    var marketLive = true
+    var marketCheckedAt = 0.0
+    var confirmReset = false         // 「恢复默认」点过一次，等第二次确认
+    var menuOpen: String?            // 菜单里哪个设置项的选项正展开着
+    var guideReplaces = false        // 第一次使用：引导里选的替换掉示例列表；以后再走引导：只往里加
+    var flashText: String?           // 标题条上临时显示几秒的一句话
+    var flashTimer: Timer?
+
+    func displayName(_ q: Quote, key: String) -> String {
+        let en = q.str(46)
+        if lang == "en", Market.of(key) == .hk || Market.of(key) == .us, !en.isEmpty, en.unicodeScalars.allSatisfy({ $0.isASCII }), Double(en) == nil { return en }
+        return q.name
+    }
+
+    /// 这个程序早期叫 Peek。第一次以新名字运行时，把旧的配置、偏好和开机启动项搬过来，之后就不再看旧位置
+    func migrateFromOldName() {
+        guard testHome == nil else { return }
+        let fm = FileManager.default, home = fm.homeDirectoryForCurrentUser
+        let oldDir = home.appendingPathComponent(".peek")
+        if !fm.fileExists(atPath: configDir.path), fm.fileExists(atPath: oldDir.path) { try? fm.moveItem(at: oldDir, to: configDir) }
+        if store.object(forKey: "migrated") == nil {
+            if let old = UserDefaults(suiteName: "local.peek")?.dictionaryRepresentation() {
+                for k in ["right", "top", "mini", "tab", "onboarded", "detailMore"] { if let v = old[k], store.object(forKey: k) == nil { store.set(v, forKey: k) } }
+            }
+            store.set(true, forKey: "migrated")
+        }
+        let oldAgent = home.appendingPathComponent("Library/LaunchAgents/local.peek.plist")
+        if fm.fileExists(atPath: oldAgent.path) {          // 旧的开机启动项指向旧程序：删掉，按新路径重新建一个
+            try? fm.removeItem(at: oldAgent)
+            if !loginItemOn { toggleLoginItem() }
+        }
+    }
+
+    /// 实际显示的自选股：最多 maxStocks 只，免得小窗比屏幕还高
+    var allStocks: [String] { Array(cfg.stocks.prefix(maxStocks)) }
+    /// 某只股票属于哪一页：a / hk / us。写错的代码归到 A 股页，方便看到并改掉
+    static func tabOf(_ raw: String) -> String {
+        guard isValidCode(raw) else { return "a" }
+        switch Market.of(apiSymbol(raw)) { case .hk: return "hk"; case .us: return "us"; default: return "a" }
+    }
+    static var tabNames: [String: String] { ["a": T("A股", "CN"), "hk": T("港股", "HK"), "us": T("美股", "US")] }
+    /// 有股票的市场才有标签页
+    var tabIDs: [String] { ["a", "hk", "us"].filter { id in allStocks.contains { AppDelegate.tabOf($0) == id } } }
+    var tab = "a" { didSet { if tab != oldValue { store.set(tab, forKey: "tab") } } }
+    /// 当前这一页显示的股票
+    var shown: [String] {
+        let ids = tabIDs
+        let cur = ids.contains(tab) ? tab : (ids.first ?? "a")
+        return allStocks.filter { AppDelegate.tabOf($0) == cur }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        migrateFromOldName()
+        let firstRun = !FileManager.default.fileExists(atPath: configURL.path)      // 还没有配置文件 = 第一次用
+        if let c = loadConfig() { cfg = c } else { configBad = true }
+
+        panel = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 160, height: 80),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.allowsToolTipsWhenApplicationIsInactive = true
+        panel.contentView = board
+
+        board.onHover = { [weak self] inside in
+            guard let self = self else { return }
+            self.hovering = inside
+            self.applyConfig()
+            self.render()
+            self.scheduleAutoClose()
+            self.schedulePageClose()
+            if !inside { self.returnFocus() }
+            if inside, Date().timeIntervalSince(self.lastFetchAt) > 1 { self.refresh() }   // 鼠标一移上来就拉最新的
+        }
+        board.onHoverRow = { [weak self] i in
+            guard let self = self else { return }
+            self.hoverFetch?.cancel()
+            guard let i = i, i < self.shown.count else { return }
+            let raw = self.shown[i]
+            // 鼠标在某一行停住 0.25 秒才预拉它的分时：点开时走势图直接出来，又不会因为划过一排就连发请求
+            let w = DispatchWorkItem { [weak self] in self?.fetchMinutes(for: raw, force: false) }
+            self.hoverFetch = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+        }
+        board.onContextMenu = { [weak self] row in
+            guard let self = self else { return }
+            let list = self.shown
+            guard let r = row, r < list.count else { self.openMenu(row: nil); return }
+            let raw = list[r]
+            let name = self.cfg.aliases[raw] ?? self.quotes[apiSymbol(raw)].map { self.displayName($0, key: apiSymbol(raw)) } ?? raw
+            var opts = [T("移除", "Remove")]
+            if r > 0 { opts.append(T("移到最前", "Move to top")) }
+            let at = self.board.convert(self.panel.mouseLocationOutsideOfEventStream, from: nil)
+            self.board.dropSel = -1
+            self.board.dropdown = BoardView.Dropdown(row: r, options: opts, current: -1, anchor: NSPoint(x: at.x, y: at.y + 2)) { i in
+                if i == 0 {
+                    if self.selected == raw { self.selected = nil }
+                    if self.mutateConfig({ $0.removeAll { $0 == raw } }) { self.flash(T("已移除「\(name)」", "Removed \(name)")) }
+                    else { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+                } else {
+                    self.edit { $0.removeAll { $0 == raw }; $0.insert(raw, at: 0) }
+                }
+            }
+        }
+        board.onReorder = { [weak self] from, to in
+            guard let self = self else { return }
+            let list = self.shown
+            guard from < list.count, to < list.count else { return }
+            let moving = list[from], target = list[to]
+            // 只在当前这一页里换位置：在整份列表里把它挪到目标那只的前面或后面
+            self.edit { (all: inout [String]) in
+                all.removeAll { $0 == moving }
+                if let ti = all.firstIndex(of: target) { all.insert(moving, at: to > from ? ti + 1 : ti) } else { all.append(moving) }
+            }
+        }
+        board.onMenu = { [weak self] in self?.openMenu(row: nil) }
+        board.onBack = { [weak self] in self?.closePage() }
+
+        board.onRemove = { [weak self] in
+            guard let self = self, let raw = self.selected else { return }
+            let name = self.cfg.aliases[raw] ?? self.quotes[apiSymbol(raw)].map { self.displayName($0, key: apiSymbol(raw)) } ?? raw
+            self.selected = nil
+            if self.mutateConfig({ $0.removeAll { $0 == raw } }) { self.flash(T("已移除「\(name)」", "Removed \(name)")) }
+            else { self.flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+        }
+        board.onArrow = { [weak self] d in
+            guard let self = self, let cur = self.selected else { return }
+            let list = self.shown
+            guard var i = list.firstIndex(of: cur) else { return }
+            repeat { i += d } while i >= 0 && i < list.count && self.quotes[apiSymbol(list[i])] == nil      // 跳过没有行情的行
+            guard i >= 0, i < list.count else { return }            // 到头了就停住
+            self.selected = list[i]
+            self.board.reveal(row: i)
+            self.board.resetZoom()
+            self.fetchMinutes(for: list[i], force: false)
+            self.render()
+            self.scheduleAutoClose()
+        }
+        board.onSearch = { [weak self] q in self?.searchChanged(q) }
+        board.onAdd = { [weak self] in self?.addStock() }
+        expanded = false        // 「更多列」功能已去掉：想看更多，点一行看详情就够了
+        board.onToggleExpand = { [weak self] in
+            guard let self = self else { return }
+            self.expanded.toggle()
+            store.set(self.expanded, forKey: "expanded")
+            self.render()
+        }
+        board.onSelectTab = { [weak self] i in
+            guard let self = self, i < self.tabIDs.count else { return }
+            self.tab = self.tabIDs[i]
+            self.selected = nil
+            self.board.detail = nil; self.closing = false      // 换页时详情直接关掉，不播收起动画
+            self.render()
+            self.refresh()
+        }
+        detailMore = store.bool(forKey: "detailMore")
+        board.onToggleMore = { [weak self] in
+            guard let self = self else { return }
+            self.detailMore.toggle()
+            store.set(self.detailMore, forKey: "detailMore")
+            self.render()
+        }
+        mini = store.bool(forKey: "mini")
+        board.onToggleMini = { [weak self] in self?.toggleMini() }
+        board.onClose = { [weak self] in self?.closePage(); self?.panel.orderOut(nil); self?.updateCheer() }     // 只是藏起来，⌃⌥S 或菜单栏小圆点叫回
+        board.onClickRow = { [weak self] i in
+            guard let self = self else { return }
+            let list = self.shown
+            if let i = i, i < list.count, self.quotes[apiSymbol(list[i])] != nil, self.selected != list[i] {
+                self.selected = list[i]
+                self.board.reveal(row: i)
+                self.board.resetZoom()
+                self.fetchMinutes(for: list[i], force: false)
+            } else {
+                self.selected = nil      // 再点一次同一行，或点详情区域，收起
+            }
+            self.render()
+            self.scheduleAutoClose()
+        }
+
+        // 位置：记住右上角钉在哪里，第一次放右下角
+        if store.object(forKey: "right") != nil {
+            anchorRight = CGFloat(store.double(forKey: "right")); anchorTop = CGFloat(store.double(forKey: "top"))
+        } else if store.object(forKey: "left") != nil {        // 旧版本记的是左上角
+            anchorRight = CGFloat(store.double(forKey: "left")) + ceil(CGFloat(cfg.fontSize) * 21)
+            anchorTop = CGFloat(store.double(forKey: "top"))
+        } else if let vf = NSScreen.main?.visibleFrame {
+            anchorRight = vf.maxX - 20; anchorTop = vf.minY + 150
+        }
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: nil) { [weak self] _ in
+            guard let self = self, !self.resizing else { return }    // 只认用户自己拖的
+            let f = self.panel.frame
+            self.anchorRight = f.maxX; self.anchorTop = f.maxY
+            store.set(Double(f.maxX), forKey: "right"); store.set(Double(f.maxY), forKey: "top")
+        }
+        // 拔掉外接屏、改分辨率后重新摆一次，别留在看不见的地方
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.render()
+        }
+
+        tab = store.string(forKey: "tab") ?? "a"
+        for id in ["a", "hk", "us"] {       // 先把上次存的行情读出来，小窗一出现就有数，不用等网络
+            if let t = try? String(contentsOf: configDir.appendingPathComponent("cache_\(id).txt"), encoding: .utf8) {
+                for (k, v) in parseQuotes(t) { quotes[k] = v }
+            }
+        }
+        applyConfig()
+        render()
+        panel.orderFrontRegardless()
+        if let v = ProcessInfo.processInfo.environment["PEEK_CHEER_T"].flatMap({ Double($0) }) { board.pose = v < 0 ? Pose.resting(at: -v, asleep: true) : cheerPose(at: v) }   // 调试用：定在这套动作的第几秒（负数 = 休息姿势）
+        else { updateCheer() }
+        if let g = ProcessInfo.processInfo.environment["PEEK_GAZE"]?.split(separator: ",").compactMap({ Double($0) }), g.count == 2 {
+            board.gaze = NSPoint(x: g[0], y: g[1]); board.facing = true; board.pose = Pose.resting(at: 0.8, asleep: false)
+        }
+        // 捏合手势：系统只发给前台应用的窗口。小窗不在前台时从这里接
+        NSEvent.addGlobalMonitorForEvents(matching: [.magnify, .scrollWheel]) { [weak self] e in
+            guard let self = self else { return }
+            if e.type == .magnify { self.board.externalMagnify(e.magnification) }
+            else if self.board.chartPoint() != nil {
+                glog("scroll(global) dx=\(e.scrollingDeltaX) dy=\(e.scrollingDeltaY)")
+                _ = self.board.chartScroll(dx: Double(e.scrollingDeltaX), dy: Double(e.scrollingDeltaY), precise: e.hasPreciseScrollingDeltas)
+            }
+        }
+        // 智能缩放手势（双指轻点两下）也接上：在走势图上轻点两下，放大 / 回到全天
+        NSEvent.addLocalMonitorForEvents(matching: [.smartMagnify]) { [weak self] e in
+            if let b = self?.board, b.chartPoint() != nil { glog("smartMagnify"); b.toggleZoom() }
+            return e
+        }
+        if testHome == nil { registerHotKey() }
+        // 另一个 Peek 被启动时会发这个通知：把藏起来的小窗叫出来
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("local.cheerup.show"), object: nil, queue: .main) { [weak self] _ in
+            self?.show()
+        }
+        refresh()
+        if firstRun && !store.bool(forKey: "onboarded") {
+            guideReplaces = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.showOnboarding() }
+        }
+        // 调试用（不模拟键鼠）：PEEK_SHOW=menu / add / guide 启动后自己翻到对应页面；PEEK_QUERY 填入搜索词；PEEK_PICK 点第几条结果
+        let env = ProcessInfo.processInfo.environment
+        if let what = env["PEEK_SHOW"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+                guard let self = self else { return }
+                if what == "menu" { self.openMenu(row: env["PEEK_ROW"].flatMap { Int($0) }) }
+                if what == "menu", env["PEEK_RESET"] != nil, let i = self.board.pageRows.lastIndex(where: { $0.action != nil }), i > 0 { self.board.pageRows[i - 1].action?() }
+                if what == "guide" { self.guideMarkets = ["a", "hk"]; self.guidePicked = [AppDelegate.popular[0].1[1]]; self.openGuide(env["PEEK_STEP"].flatMap { Int($0) } ?? 0) }
+                if what == "add" {
+                    self.addStock()
+                    if let q = env["PEEK_QUERY"] {       // 通过输入框自己的编辑器填字，走和真实打字一样的路径
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { (self.board.searchField.currentEditor() as? NSTextView)?.insertText(q, replacementRange: NSRange(location: 0, length: 0)) }
+                    }
+                    if let n = env["PEEK_PICK"].flatMap({ Int($0) }) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { if n < self.board.pageRows.count { self.board.pageRows[n].action?() } }
+                    }
+                }
+            }
+        }
+        for (n, code) in (ProcessInfo.processInfo.environment["PEEK_KEYS"] ?? "").split(separator: ",").compactMap({ UInt16($0) }).enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.2 + 0.4 * Double(n)) { [weak self] in
+                guard let self = self, let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: self.panel.windowNumber,
+                                                              context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code) else { return }
+                let fr = self.panel.firstResponder === self.board
+                (self.panel.firstResponder as? NSResponder ?? self.board).keyDown(with: e)
+                FileHandle.standardError.write("key \(code): responder=board \(fr), selected=\(self.selected ?? "nil"), page=\(self.board.page)\n".data(using: .utf8)!)
+            }
+        }
+        if let r = ProcessInfo.processInfo.environment["PEEK_RCLICK"].flatMap({ Int($0) }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in self?.board.onContextMenu?(r) }
+        }
+        if let mv = ProcessInfo.processInfo.environment["PEEK_MOVE"]?.split(separator: ",").compactMap({ Int($0) }), mv.count == 2 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in self?.board.onReorder?(mv[0], mv[1]) }
+        }
+        if let h = ProcessInfo.processInfo.environment["PEEK_HOVER"].flatMap({ Int($0) }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in self?.board.debugHover(row: h) }
+        }
+        // 调试用：PEEK_SELECT=2 启动后自动展开第 3 行
+        if let s = ProcessInfo.processInfo.environment["PEEK_SELECT"], let i = Int(s) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.board.onClickRow?(i) }
+        }
+    }
+
+    func applyConfig() {
+        board.cfg = cfg
+        UI.theme = cfg.theme; UI.fontSize = CGFloat(cfg.fontSize); UI.color = cfg.color
+        lang = cfg.language.isEmpty ? systemLang() : cfg.language
+        // 鼠标停在小窗上时允许被截图（方便自己截），移开后截图和屏幕共享里都看不到
+        panel.sharingType = (cfg.hideFromScreenShare && !hovering) ? .none : .readOnly
+        // 快捷键没注册上时必须留着菜单栏小圆点，不然隐藏后就叫不回来了
+        let wantIcon = cfg.menuBarIcon || !hotKeyOK
+        if wantIcon, statusItem == nil {
+            // 新图标默认排在最左边，在带刘海的 MacBook 屏幕上会被刘海挡住看不见。
+            // 第一次创建时把它排到靠右的位置（系统图标旁边）；之后用户按住 ⌘ 拖动过就以用户的为准
+            let posKey = "NSStatusItem Preferred Position WatchUp"
+            if UserDefaults.standard.object(forKey: posKey) == nil { UserDefaults.standard.set(360.0, forKey: posKey) }
+            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            statusItem?.autosaveName = "WatchUp"
+            statusItem?.button?.image = AppDelegate.barIcon()
+            statusItem?.button?.toolTip = "CheerUp"
+            statusItem?.button?.target = self
+            statusItem?.button?.action = #selector(statusClicked)
+        } else if !wantIcon, let s = statusItem {
+            NSStatusBar.system.removeStatusItem(s); statusItem = nil
+        }
+        let interval = cfg.refreshSeconds
+        if timer?.timeInterval != interval {
+            timer?.invalidate()
+            let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.refresh() }
+            t.tolerance = interval * 0.1
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
+    }
+
+    // MARK: 小窗里的页面：菜单 / 添加 / 引导（都在小窗这一块里完成，不另开窗口）
+
+    func setPage(_ p: Page, title: String, rows: [PRow], foot: String = "", nav: [(String, () -> Void)] = [], dots: (Int, Int)? = nil, minRows: Int = 0) {
+        selected = nil; board.detail = nil; closing = false
+        if mini { mini = false; store.set(false, forKey: "mini") }
+        if !panel.isVisible { panel.orderFrontRegardless() }
+        let wasAdd = board.page == .add
+        board.dropdown = nil; board.pageAction = nil
+        board.page = p; board.pageTitle = title; board.pageRows = rows; board.pageFoot = foot; board.pageFootAccent = false
+        board.pageNav = nav; board.pageDots = dots; board.pageMinRows = minRows
+        if wasAdd, p != .add { releaseKeyboard() }
+        render()
+        board.placeSearchField()
+    }
+
+    /// 把前台还给原来的程序
+    func returnFocus() {
+        guard let app = borrowedFrom else { return }
+        borrowedFrom = nil
+        if NSApp.isActive { app.activate(options: []) }
+    }
+
+    /// 详情展开或翻到别的页面时接住键盘（↑↓ 换一只 / 换一行）；回到普通列表就把键盘还给原来的窗口
+    func syncKeyboard() {
+        guard let kp = panel as? KeyPanel else { return }
+        let need = panel.isVisible && !mini && (selected != nil || board.page != .list)
+        if need {
+            if !kp.allowKey || !panel.isKeyWindow { kp.allowKey = true; panel.makeKey() }
+            if board.page != .add, panel.firstResponder !== board { panel.makeFirstResponder(board) }
+        } else if kp.allowKey {
+            releaseKeyboard()
+            returnFocus()
+        }
+    }
+
+    /// 「添加」页借用了键盘焦点，离开时还给原来的窗口
+    func releaseKeyboard() {
+        (panel as? KeyPanel)?.allowKey = false
+        panel.makeFirstResponder(nil)
+        if panel.isKeyWindow, panel.isVisible { panel.orderOut(nil); panel.orderFrontRegardless() }
+    }
+
+    func closePage() {
+        guard board.page != .list else { return }
+        let wasAdd = board.page == .add
+        board.page = .list; board.pageRows = []; board.pageNav = []; board.pageFoot = ""; board.pageDots = nil; board.pageMinRows = 0
+        board.keyNav = false; board.dropdown = nil; board.pageAction = nil
+        board.placeSearchField()
+        searchTimer?.invalidate()
+        if wasAdd { releaseKeyboard() }
+        render(); refresh()
+    }
+
+    /// 菜单页和详情一样是「临时翻出来看一眼」的东西：鼠标离开 5 秒自己收回。添加和设置页要打字、要做选择，不自动收
+    func schedulePageClose() {
+        pageIdle?.invalidate(); pageIdle = nil
+        guard board.page == .menu, !hovering, cfg.detailAutoCloseSeconds > 0 else { return }
+        pageIdle = Timer.scheduledTimer(withTimeInterval: cfg.detailAutoCloseSeconds, repeats: false) { [weak self] _ in
+            guard let self = self, !self.hovering, self.board.page == .menu else { return }
+            self.closePage()
+        }
+    }
+
+    func openMenu(row: Int?, keepOpen: Bool = false) {
+        if board.page == .menu, row == nil { closePage(); return }
+        if !keepOpen { menuOpen = nil; confirmReset = false }
+        var rows: [PRow] = []
+        let list = shown
+        // 设置项：名称在左，当前值在右。点一下在这一行下面展开选项，再点某个选项才生效
+        let reopen: () -> Void = { [weak self] in self?.board.page = .list; self?.openMenu(row: row, keepOpen: true) }
+        func setting(_ id: String, _ title: String, current: String, options: [(String, String)], apply: @escaping (String) -> Void) {
+            let idx = rows.count
+            let cur = options.firstIndex { $0.0 == current } ?? 0
+            rows.append(PRow(text: title, right: options[cur].1 + "  ▾", action: { [weak self] in
+                guard let self = self else { return }
+                self.board.dropSel = cur
+                self.board.dropdown = BoardView.Dropdown(row: idx, options: options.map { $0.1 }, current: cur) { i in
+                    if i != cur { apply(options[i].0) }
+                    reopen()
+                }
+            }))
+        }
+        // 第一组：收起后的拉拉队
+        if cfg.miniStyle != "face" {
+            setting("size", T("拉拉队大小", "Cheerleader size"), current: cfg.mascotSize,
+                    options: [("s", T("小", "Small")), ("m", T("中", "Medium")), ("l", T("大", "Large"))]) { [weak self] v in
+                _ = self?.mutateConfigObject { $0["mascotSize"] = v }
+            }
+            setting("pom", T("花球配色", "Pom-pom color"), current: cfg.pomColor == "white" ? "auto" : cfg.pomColor,
+                    options: [("auto", T("跟随市场", "Match market")), ("red", T("红", "Red")), ("green", T("绿", "Green")),
+                              ("yellow", T("黄", "Yellow")), ("blue", T("蓝", "Blue"))]) { [weak self] v in
+                _ = self?.mutateConfigObject { $0["pomColor"] = v }
+            }
+            // 作息跟着哪个市场走：那个市场开盘就跳，休市就睡
+            setting("rest", T("拉拉队作息", "Cheerleader hours"), current: cfg.restSchedule,
+                    options: [("auto", T("跟随当前市场", "This market")), ("a", T("跟随 A 股", "China")), ("hk", T("跟随港股", "Hong Kong")),
+                              ("us", T("跟随美股", "US")), ("never", T("永不休息", "Never rests"))]) { [weak self] v in
+                _ = self?.mutateConfigObject { $0["restSchedule"] = v }
+                self?.marketCheckedAt = 0
+            }
+            rows.append(PRow(sep: true))
+        }
+        // 第二组：程序本身
+        setting("lang", T("语言", "Language"), current: lang, options: [("zh", "中文"), ("en", "English")]) { [weak self] v in
+            _ = self?.mutateConfigObject { $0["language"] = v }
+        }
+        setting("login", T("登录时打开", "Open at login"), current: loginItemOn ? "on" : "off",
+                options: [("on", T("开", "On")), ("off", T("关", "Off"))]) { [weak self] _ in self?.toggleLoginItem() }
+        rows.append(PRow(sep: true))
+        // 恢复默认设置：和别的操作一样是列表里的一行。要点两次才生效，免得误触
+        let confirming = confirmReset
+        let resetAction: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            if confirming {
+                self.confirmReset = false
+                // 拉拉队和外观的设置回到默认；自选股、别名、语言不动
+                let keep = ["stocks", "aliases", "language"]
+                _ = self.mutateConfigObject { obj in obj = obj.filter { keep.contains($0.key) } }
+                self.marketCheckedAt = 0
+                self.flash(T("已恢复默认", "Defaults restored"))
+            } else {
+                self.confirmReset = true
+            }
+            reopen()
+        }
+        rows.append(PRow(text: confirming ? T("再点一次确认恢复", "Click again to restore") : T("恢复默认设置", "Restore default settings"), check: confirming ? true : nil, action: resetAction))
+        rows.append(PRow(text: T("退出 CheerUp", "Quit CheerUp"), action: { NSApp.terminate(nil) }))
+        setPage(.menu, title: T("设置", "Settings"), rows: rows)
+
+        schedulePageClose()
+    }
+
+    /// 点顶部栏的图标：小窗藏着就叫出来，开着就藏起来
+    @objc func statusClicked() { toggle() }
+
+    /// 顶部栏图标：小窗里一条带箭头的走势线。模板图，系统会按深浅色自动上色
+    static func barIcon() -> NSImage {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            // 圆角小窗里一条带箭头的上扬走势线。占满 18 点的格子，和旁边的系统图标一样大
+            NSColor.black.setStroke()
+            let frame = NSBezierPath(roundedRect: NSRect(x: 0.9, y: 2.3, width: 16.2, height: 13.4), xRadius: 3.8, yRadius: 3.8)
+            frame.lineWidth = 1.5; frame.stroke()
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: 4.2, y: 11.6)); line.line(to: NSPoint(x: 7.0, y: 8.9)); line.line(to: NSPoint(x: 9.4, y: 10.6)); line.line(to: NSPoint(x: 13.4, y: 6.6))
+            line.move(to: NSPoint(x: 10.6, y: 6.4)); line.line(to: NSPoint(x: 13.6, y: 6.4)); line.line(to: NSPoint(x: 13.6, y: 9.4))
+            line.lineWidth = 1.6; line.lineCapStyle = .round; line.lineJoinStyle = .round; line.stroke()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+
+    // —— 添加 ——
+
+    @objc func addStock() {
+        if board.page == .add { closePage(); return }
+        lastHits = []
+        board.searchField.stringValue = ""
+        board.keySel = 0
+        setPage(.add, title: T("添加", "Add"), rows: [], minRows: 6)
+        (panel as? KeyPanel)?.allowKey = true
+        panel.makeKey()
+        panel.makeFirstResponder(board.searchField)
+    }
+
+    func searchChanged(_ text: String) {
+        searchTimer?.invalidate()
+        searchSeq += 1
+        guard board.page == .add else { return }
+        guard let (q, market) = cleanQuery(text) else {
+            lastHits = []
+            let typed = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            showHits(foot: typed ? T("只能搜名称、拼音或代码", "Search by name or ticker only") : "")
+            return
+        }
+        let mine = searchSeq
+        if lastHits.isEmpty { showHits(foot: T("搜索中…", "Searching…")) }
+        let t = Timer(timeInterval: 0.22, repeats: false) { [weak self] _ in      // 停手一小会儿再搜，别每个字母都发请求
+            self?.runSearch(q, market: market, shown: text.trimmingCharacters(in: .whitespacesAndNewlines)) { hits, foot in
+                guard let self = self, self.searchSeq == mine, self.board.page == .add else { return }    // 旧结果回来晚了就丢掉
+                self.lastHits = Array(hits.prefix(6))
+                self.board.keySel = 0
+                // 搜到的都已经在列表里：别再提示「回车添加」
+                let allListed = !self.lastHits.isEmpty && self.lastHits.allSatisfy { self.isListed($0) }
+                self.showHits(foot: allListed ? T("已经在列表里了", "Already in your list") : foot)
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        searchTimer = t
+    }
+
+    /// 一次完整的搜索，带三层兜底：
+    /// 1. 搜索接口正常返回结果 → 直接用
+    /// 2. 没结果或接口不通，而输入像一个代码 → 直接问行情接口有没有这只
+    /// 3. 还是没有，而输入是名称 → 去掉最后一个字再搜（多半是打错了一个字），告诉用户这是相近的结果
+    func runSearch(_ q: String, market: String?, shown: String, done: @escaping ([SearchHit], String) -> Void) {
+        let pick = T("↑↓ 选择，回车添加", "↑↓ to select, Return to add")
+        func byCode(else fallback: @escaping () -> Void) {
+            let cands = codeCandidates(q).filter { c in market.map { c.hasPrefix($0) || (c.hasPrefix("r_hk") && $0 == "hk") } ?? true }
+            guard !cands.isEmpty else { fallback(); return }
+            fetchQuotes(cands) { quotes in
+                guard let quotes = quotes else { fallback(); return }
+                let hits = cands.compactMap { key -> SearchHit? in
+                    guard let quote = quotes[key], quote.prevClose > 0 || quote.price > 0 else { return nil }
+                    let mk = Market.of(key)
+                    let short = mk == .us ? String(key.dropFirst(2)) : quote.code
+                    let code = mk == .hk ? "hk" + quote.code : (mk == .us ? key : (apiSymbol(quote.code) == key ? quote.code : key))
+                    let tag = mk == .hk ? T("港股", "HK") : (mk == .us ? T("美股", "US") : (key.hasPrefix("sh") ? T("沪", "SH") : (key.hasPrefix("sz") ? T("深", "SZ") : T("北", "BJ"))))
+                    return SearchHit(code: code, name: self.displayName(quote, key: key), shortCode: short, market: tag, tag: quote.str(61).contains("ZS") ? T("指数", "Index") : tag)
+                }
+                if hits.isEmpty { fallback() } else { done(hits, pick) }
+            }
+        }
+        func shorter(_ word: String, tries: Int) {
+            let cjk = word.unicodeScalars.contains { $0.value >= 0x2E80 }
+            guard tries > 0, word.count > (cjk ? 1 : 3) else { done([], T("没找到「\(shown)」", "No results for “\(shown)”")); return }
+            let w = String(word.dropLast())
+            searchStocks(w, query: w, market: market) { hits, _ in
+                if hits.isEmpty { shorter(w, tries: tries - 1) }
+                else { done(hits, T("没找到「\(shown)」，相近的有", "No “\(shown)”. Similar:")) }
+            }
+        }
+        let idx = indexHits(shown, market: market)        // 用原始输入匹配（清洗会去掉 & 这样的符号）
+        searchStocks(q, query: q, market: market) { hits, ok in
+            var seen = Set<String>()
+            let merged = (idx + hits).filter { seen.insert(apiSymbol($0.code)).inserted }
+            if !merged.isEmpty { done(merged, pick); return }
+            byCode {
+                if ok { shorter(q, tries: 2) } else { done([], T("没连上网络", "No connection")) }
+            }
+        }
+    }
+
+    /// 直接问行情接口。返回 nil 表示没连上
+    func fetchQuotes(_ keys: [String], done: @escaping ([String: Quote]?) -> Void) {
+        guard let url = URL(string: host("https://qt.gtimg.cn/") + "q=" + keys.joined(separator: ",")) else { done(nil); return }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 6)
+        req.setValue("https://gu.qq.com", forHTTPHeaderField: "Referer")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let parsed = data.flatMap { String(data: $0, encoding: gbk) }.map(parseQuotes)
+            DispatchQueue.main.async { done(parsed) }
+        }.resume()
+    }
+
+    func isListed(_ h: SearchHit) -> Bool { cfg.stocks.contains { isValidCode($0) && apiSymbol($0) == apiSymbol(h.code) } }
+
+    /// 把搜索结果画成和股票列表一样的行：名称在左，代码和市场在右
+    func showHits(foot: String, accent: Bool = false) {
+        board.pageRows = lastHits.map { h in
+            let listed = isListed(h)
+            return PRow(text: h.name, right: listed ? T("已添加", "Added") : "\(h.shortCode)  \(h.tag.isEmpty ? h.market : h.tag)", dim: listed,
+                        action: listed || adding ? nil : { [weak self] in self?.addHit(h) })
+        }
+        board.pageFoot = foot; board.pageFootAccent = accent
+        render()
+    }
+
+    /// 加进列表之前先确认这只真的有行情：搜索结果里偶尔有已退市、长期停牌、行情接口不收录的
+    func addHit(_ h: SearchHit) {
+        if isListed(h) { showHits(foot: T("「\(h.name)」已经在列表里", "\(h.name) is already listed"), accent: true); return }
+        if cfg.stocks.count >= maxStocks { showHits(foot: T("最多 \(maxStocks) 只，先移除几只", "Limit is \(maxStocks). Remove some first"), accent: true); return }
+        guard !adding else { return }
+        adding = true
+        showHits(foot: T("正在确认「\(h.name)」…", "Checking \(h.name)…"))
+        let key = apiSymbol(h.code)
+        fetchQuotes([key]) { [weak self] quotes in
+            guard let self = self else { return }
+            self.adding = false
+            guard self.board.page == .add else { return }
+            guard let quotes = quotes else { self.showHits(foot: T("没连上网络，没添加", "No connection. Not added"), accent: true); return }
+            guard let q = quotes[key], q.prevClose > 0 || q.price > 0 else {
+                self.showHits(foot: T("「\(h.name)」查不到行情，没添加", "No quote for \(h.name). Not added"), accent: true); return
+            }
+            if q.str(40) == "D" || (q.stamp.map { Date().timeIntervalSince($0) > 45 * 86400 } ?? false) {      // 接口把退市、长期停牌的标成 D
+                self.showHits(foot: T("「\(h.name)」已停止交易，没添加", "\(h.name) no longer trades. Not added"), accent: true); return
+            }
+            guard self.mutateConfig({ $0.append(h.code) }) else { self.showHits(foot: T("配置文件有误，没保存", "Config file error. Not saved"), accent: true); return }
+            self.quotes[key] = q                   // 回到列表时这一行马上有数
+            self.tab = AppDelegate.tabOf(h.code)   // 回到列表，停在它所在的那一页，标题条上提示一句
+            self.closePage()
+            self.flash(T("已添加「\(h.name)」", "Added \(h.name)"))
+        }
+    }
+
+    // —— 引导 ——
+
+    static var popular: [(String, [SearchHit])] {
+        func h(_ code: String, _ zh: String, _ en: String, _ short: String, _ mk: String) -> SearchHit { SearchHit(code: code, name: T(zh, en), shortCode: short, market: mk) }
+        let sh = T("沪", "SH"), sz = T("深", "SZ"), hk = T("港股", "HK"), us = T("美股", "US")
+        return [
+            ("a", [h("sh000001", "上证指数", "SSE Composite", "000001", sh), h("600519", "贵州茅台", "Kweichow Moutai", "600519", sh),
+                   h("300750", "宁德时代", "CATL", "300750", sz), h("002594", "比亚迪", "BYD", "002594", sz)]),
+            ("hk", [h("hkHSI", "恒生指数", "Hang Seng", "HSI", hk), h("hk00700", "腾讯控股", "Tencent", "00700", hk), h("hk09988", "阿里巴巴", "Alibaba", "09988", hk)]),
+            ("us", [h("us.IXIC", "纳斯达克", "Nasdaq", ".IXIC", us), h("usAAPL", "苹果", "Apple", "AAPL", us), h("usNVDA", "英伟达", "NVIDIA", "NVDA", us)]),
+        ]
+    }
+
+    @objc func showOnboarding() { guideMarkets = ["a"]; guidePicked = []; openGuide(0) }
+
+    func openGuide(_ step: Int) {
+        guideStep = step
+        var rows: [PRow] = []
+        var title = ""
+        switch step {
+        case 0:         // 语言：选了立刻生效，后面两步就用这个语言
+            title = "语言 / Language"
+            for (id, name) in [("zh", "中文"), ("en", "English")] {
+                rows.append(PRow(text: name, check: lang == id, action: { [weak self] in
+                    guard let self = self else { return }
+                    lang = id
+                    if !self.mutateConfigObject({ $0["language"] = id }) { self.cfg.language = id }
+                    self.openGuide(0)
+                }))
+            }
+        case 1:
+            title = T("选择市场", "Markets")
+            for (id, name) in [("a", T("A 股", "China A-shares")), ("hk", T("港股", "Hong Kong")), ("us", T("美股", "US"))] {
+                rows.append(PRow(text: name, check: guideMarkets.contains(id), action: { [weak self] in
+                    guard let self = self else { return }
+                    if self.guideMarkets.contains(id) { if self.guideMarkets.count > 1 { self.guideMarkets.remove(id) } } else { self.guideMarkets.insert(id) }
+                    self.openGuide(1)
+                }))
+            }
+        default:
+            title = T("挑几只", "Pick a few")
+            for h in AppDelegate.popular.filter({ guideMarkets.contains($0.0) }).flatMap({ $0.1 }) {
+                let on = guidePicked.contains { $0.code == h.code }
+                rows.append(PRow(text: h.name, right: "\(h.shortCode)  \(h.market)", check: on, action: { [weak self] in
+                    guard let self = self else { return }
+                    if on { self.guidePicked.removeAll { $0.code == h.code } } else { self.guidePicked.append(h) }
+                    self.openGuide(2)
+                }))
+            }
+        }
+        var nav: [(String, () -> Void)] = []
+        if step == 0 { nav.append((T("跳过", "Skip"), { [weak self] in store.set(true, forKey: "onboarded"); self?.closePage() })) }
+        else { nav.append((T("上一步", "Back"), { [weak self] in self?.openGuide(step - 1) })) }
+        if step < 2 { nav.append((T("下一步", "Next"), { [weak self] in self?.openGuide(step + 1) })) }
+        else { nav.append((T("完成", "Done"), { [weak self] in self?.finishGuide() })) }
+        setPage(.guide, title: title, rows: rows, foot: step == 2 ? T("之后点 + 可以再加", "Add more later with +") : "", nav: nav, dots: (step, 3))
+    }
+
+    func finishGuide() {
+        store.set(true, forKey: "onboarded")
+        let codes = guidePicked.map { $0.code }
+        if !codes.isEmpty {        // 一只都没选就不动原来的列表
+            let replace = guideReplaces
+            let ok = mutateConfigObject { obj in
+                let old = replace ? [] : ((obj["stocks"] as? [String]) ?? [])
+                obj["stocks"] = old + codes.filter { c in !old.contains { isValidCode($0) && apiSymbol($0) == apiSymbol(c) } }
+            }
+            if !ok { flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+            tab = AppDelegate.tabOf(codes[0])
+        }
+        guideReplaces = false
+        closePage()
+    }
+
+    /// 在标题条上显示几秒钟的一句话（代替系统提示框）
+    func flash(_ text: String) {
+        flashText = text
+        flashTimer?.invalidate()
+        flashTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in self?.flashText = nil; self?.render() }
+        render()
+    }
+
+    @objc func show() {
+        if !panel.isVisible { panel.orderFrontRegardless() }
+        render(); refresh()
+        updateCheer()
+    }
+
+    @objc func toggle() {
+        closePage()
+        if panel.isVisible { panel.orderOut(nil); updateCheer() } else { show() }
+    }
+
+    /// 程序已经在跑时又被双击 / 从聚焦搜索打开：把小窗叫出来
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        show()
+        return false
+    }
+
+    // MARK: 开机自动启动（写一个 LaunchAgent，由用户自己在菜单里开关）
+
+    var loginAgentURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.cheerup.plist")
+    }
+    var loginItemOn: Bool { FileManager.default.fileExists(atPath: loginAgentURL.path) }
+
+    @objc func toggleLoginItem() {
+        if loginItemOn {
+            try? FileManager.default.removeItem(at: loginAgentURL)
+            return
+        }
+        let plist: [String: Any] = ["Label": "local.cheerup", "RunAtLoad": true,
+                                    "ProgramArguments": ["/usr/bin/open", "-g", Bundle.main.bundlePath]]
+        try? FileManager.default.createDirectory(at: loginAgentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? data.write(to: loginAgentURL)
+        }
+    }
+
+    // MARK: 增删自选股（直接改配置文件里的 stocks）
+
+    /// 读出配置 → 改 → 写回。配置格式有误时不动文件，返回 false
+    func mutateConfig(_ change: (inout [String]) -> Void) -> Bool {
+        mutateConfigObject { obj in
+            var list = (obj["stocks"] as? [String]) ?? self.cfg.stocks
+            change(&list)
+            obj["stocks"] = list
+        }
+    }
+
+    func mutateConfigObject(_ change: (inout [String: Any]) -> Void) -> Bool {
+        guard let data = try? Data(contentsOf: configURL),
+              var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              decodeConfig(data) != nil else { return false }
+        change(&obj)
+        guard let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+              (try? out.write(to: configURL, options: .atomic)) != nil else { return false }
+        refresh()
+        return true
+    }
+
+    func edit(_ change: (inout [String]) -> Void) {
+        if !mutateConfig(change) { flash(T("配置文件有误，没保存", "Config file error. Not saved")) }
+    }
+
+    struct SearchHit { var code: String; var name: String; var shortCode: String; var market: String; var tag = "" }
+
+    /// 用腾讯的搜索接口按名称 / 拼音 / 代码找股票。回调第二个参数表示接口是否连通
+    func searchStocks(_ q: String, query: String = "", market: String? = nil, done: @escaping ([SearchHit], Bool) -> Void) {
+        guard let enc = q.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
+              let url = URL(string: host("https://smartbox.gtimg.cn/") + "s3/?v=2&t=all&q=" + enc) else { done([], false); return }
+        URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 6)) { data, _, _ in
+            let text = data.flatMap { String(data: $0, encoding: .utf8) }
+            let hits = text.map { parseSearch($0, query: query, market: market) } ?? []
+            let ok = text.map { $0.contains("v_hint") } ?? false          // 返回的不是搜索结果（被拦截、报错页）也算没连上
+            DispatchQueue.main.async { done(hits, ok) }
+        }.resume()
+    }
+
+    /// 收起并且看得见的时候才播动作；展开、隐藏时停掉节拍，不白耗电
+    func updateCheer() {
+        let run = mini && panel.isVisible && cfg.miniStyle != "face" && ProcessInfo.processInfo.environment["PEEK_CHEER_T"] == nil
+        if !run { cheerTimer?.invalidate(); cheerTimer = nil; return }
+        guard cheerTimer == nil else { return }
+        cheerStart = CACurrentMediaTime() + 0.25           // 等小窗缩完再开始
+        cheerBlendFrom = nil
+        cheerResting = false; marketCheckedAt = 0
+        board.pose = cheerRoutine[0].pose
+        let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.cheerTick() }
+        RunLoop.main.add(t, forMode: .common)
+        cheerTimer = t
+    }
+
+    func cheerTick() {
+        let now = CACurrentMediaTime()
+        if now - marketCheckedAt > 5 {          // 每 5 秒看一眼当前这一页的市场是不是在交易
+            marketCheckedAt = now
+            let which = cfg.restSchedule == "auto" ? tab : cfg.restSchedule
+            let mk: Market = which == "us" ? .us : (which == "hk" ? .hk : .aStock)
+            marketLive = which == "never" || mk.status(stamp: nil).live || ProcessInfo.processInfo.environment["PEEK_FORCE_LIVE"] != nil
+        }
+        // 鼠标在它周围一圈（不必正好压在身上）就算在看它
+        let near = hovering || panel.frame.insetBy(dx: -34, dy: -34).contains(NSEvent.mouseLocation)
+        if near { lastNearAt = now }
+        // 鼠标走开后不是马上睡：先醒着 1.5 秒，然后 5 秒里眼皮越来越沉，最后才睡着
+        let away = now - lastNearAt
+        let drowsy = CGFloat(min(max((away - 1.5) / 5.0, 0), 1))
+        let asleep = !marketLive && !near && drowsy >= 1
+        let resting = near || !marketLive          // 鼠标在旁边，或者市场没在交易（午休、收盘、周末）：歇着
+        if resting != cheerResting {
+            cheerResting = resting
+            cheerBlendFrom = board.pose; cheerBlendStart = now
+            if !resting { cheerStart = now + 0.3 }      // 重新开始时从头跳
+        }
+        // 休息时一秒只算 12 个画面：动作本来就慢，没必要按 30 帧重画（它可能一歇就是一整晚）
+        let rt = (now * 20).rounded() / 20          // 休息时一秒 20 个画面：够顺，又不用按 30 帧重画
+        var target = resting ? Pose.resting(at: rt, asleep: asleep) : cheerPose(at: max(0, now - cheerStart))
+        var sleepyBlink = false
+        var zFade: CGFloat = 1
+        if resting, !near, !marketLive, drowsy > 0 {
+            // 犯困：眨眼越来越慢、闭着的时间越来越长，头一点一点往下掉。
+            // 睡着之后这些不是一下子停：头保持歪着，点头的幅度用 2 秒慢慢收掉，z 用 1.5 秒淡入
+            let since = max(0, away - 6.5)                              // 睡着了多久
+            let ph = CGFloat((rt / 1.6).truncatingRemainder(dividingBy: 1))
+            let amp = asleep ? max(0, 1 - CGFloat(since) / 2) : drowsy
+            target.hop += 1.1 * amp * max(0, sin(ph * 2 * .pi))
+            target.lean += 0.5 * drowsy
+            if asleep { zFade = CGFloat(min(1, since / 1.5)) }
+            else { sleepyBlink = ph < 0.15 + 0.8 * drowsy }             // 快睡着时几乎一直闭着，接上睡着后的闭眼
+        }
+        if zFade != board.zFade { board.zFade = zFade; board.needsDisplay = true }
+        // 鼠标停在它身上时：醒着，眼睛跟着鼠标走
+        var gaze = NSPoint.zero
+        if near {
+            let m = board.convert(panel.mouseLocationOutsideOfEventStream, from: nil)
+            let half = max(board.bounds.width, 1) / 2
+            gaze = NSPoint(x: min(max((m.x - half) / half, -1), 1), y: min(max((m.y - board.bounds.height * 0.27) / half, -1), 1))
+        }
+        if gaze != board.gaze || near != board.facing { board.gaze = gaze; board.facing = near; board.needsDisplay = true }
+        if let from = cheerBlendFrom {                      // 进入或离开休息：用 0.3 秒过渡过去，不硬切
+            let x = CGFloat(min(1, (now - cheerBlendStart) / 0.3))
+            if x >= 1 { cheerBlendFrom = nil } else { target = from.mix(target, x * x * (3 - 2 * x)) }
+        }
+        target.blink = sleepyBlink || ((!resting || near) && now.truncatingRemainder(dividingBy: 2.9) < 0.13)       // 每隔不到三秒眨一下眼
+        if target != board.pose {                           // 定住不动的那些拍子不重画
+            board.pose = target
+            board.needsDisplay = true
+        }
+    }
+
+    @objc func toggleMini() {
+        mini.toggle()
+        store.set(mini, forKey: "mini")
+        if mini { closePage(); selected = nil; board.detail = nil; closing = false }
+        if !panel.isVisible { panel.orderFrontRegardless() }
+        render()
+        updateCheer()
+        if !mini { refresh() }
+    }
+
+    @objc func editConfig() {
+        _ = loadConfig()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-e", configURL.path]
+        try? p.run()
+    }
+
+    @objc func quit() { NSApp.terminate(nil) }
+
+    func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { AppDelegate.shared?.toggle() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let st = RegisterEventHotKey(UInt32(kVK_ANSI_S), UInt32(controlKey | optionKey),
+                                     EventHotKeyID(signature: OSType(0x5045454B), id: 1),
+                                     GetApplicationEventTarget(), 0, &hotKeyRef)
+        hotKeyOK = st == noErr
+        if !hotKeyOK { applyConfig() }
+    }
+
+    func refresh() {
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: configURL.path))?[.modificationDate] as? Date
+        if mtime == nil || mtime != configMTime {       // 配置文件没改过就不重新读、不重新应用
+            if let c = loadConfig() { cfg = c; configBad = false } else { configBad = true }
+            configMTime = (try? FileManager.default.attributesOfItem(atPath: configURL.path))?[.modificationDate] as? Date
+            applyConfig()
+        }
+        syncHover()
+        // 隐藏或收成笑脸时不联网：没人看，也少留痕迹
+        guard panel.isVisible, !mini else { render(); return }
+        var seen = Set<String>()
+        let symbols = shown.filter(isValidCode).map(apiSymbol).filter { seen.insert($0).inserted }
+        guard !symbols.isEmpty,
+              let url = URL(string: host("https://qt.gtimg.cn/") + "q=" + symbols.joined(separator: ",")) else { render(); return }
+        lastFetchAt = Date()
+        requestCount += 1
+        if let t = testHome { try? "\(requestCount)".write(toFile: t + "/requests", atomically: true, encoding: .utf8) }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 6)
+        req.setValue("https://gu.qq.com", forHTTPHeaderField: "Referer")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            let text = data.flatMap { String(data: $0, encoding: gbk) }
+            let parsed = text.map(parseQuotes) ?? [:]
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if !parsed.isEmpty, let t = text, Date().timeIntervalSince(self.cacheSavedAt) > 20 {      // 存一份，下次启动先显示它
+                    self.cacheSavedAt = Date()
+                    try? t.write(to: configDir.appendingPathComponent("cache_\(self.tab).txt"), atomically: true, encoding: .utf8)
+                }
+                self.failed = parsed.isEmpty
+                let first = !self.everLoaded && !parsed.isEmpty
+                if !parsed.isEmpty { self.everLoaded = true; self.lastOK = Date() }
+                for (k, v) in parsed { self.quotes[k] = v }
+                _ = first       // 不在启动时批量预拉分时：请求太密会被行情服务器的防火墙拦截（实测遇到过）
+                self.render()
+            }
+        }.resume()
+        if let s = selected { fetchMinutes(for: s, force: false) }
+    }
+
+    /// 详情开着、鼠标又不在小窗上时开始倒计时，到点自动收起；鼠标移回来就取消
+    func scheduleAutoClose() {
+        autoCloseTimer?.invalidate()
+        autoCloseTimer = nil
+        guard selected != nil, !hovering, cfg.detailAutoCloseSeconds > 0 else { return }
+        autoCloseTimer = Timer.scheduledTimer(withTimeInterval: cfg.detailAutoCloseSeconds, repeats: false) { [weak self] _ in
+            guard let self = self, !self.hovering else { return }
+            self.selected = nil
+            self.render()
+        }
+    }
+
+    /// 拉某只的分时走势，同一只最多 30 秒拉一次。主源是腾讯（三个市场三个接口），被拦截或失败时换东方财富
+    func fetchMinutes(for raw: String, force: Bool) {
+        guard isValidCode(raw) else { return }
+        let key = apiSymbol(raw)
+        if !force, let t = minuteFetchedAt[key], Date().timeIntervalSince(t) < 30 { return }
+        guard let q = quotes[key] else { return }
+        let mk = Market.of(key, type: q.str(61))
+        minuteFetchedAt[key] = Date()
+
+        func finish(_ m: MinuteData?) {
+            // 失败时保留旧数据；从没拿到过就记成空，界面显示「暂无分时数据」
+            if let m = m, !m.prices.isEmpty {
+                minutes[key] = m.prices; minuteVols[key] = m.vols; minuteTimes[key] = m.times; minuteAvg[key] = m.avg
+            } else if minutes[key] == nil {
+                minutes[key] = []
+                minuteFetchedAt[key] = Date().addingTimeInterval(-18)     // 没拿到：12 秒后就可以再试，不用等满 30 秒
+            }
+            if selected.map(apiSymbol) == key { render() }
+        }
+        func get(_ urlText: String, _ parse: @escaping (Data) -> MinuteData, then: @escaping (MinuteData?) -> Void) {
+            guard let url = URL(string: urlText) else { then(nil); return }
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 6)
+            req.setValue("https://gu.qq.com", forHTTPHeaderField: "Referer")
+            URLSession.shared.dataTask(with: req) { data, _, _ in
+                let m = data.map(parse)
+                DispatchQueue.main.async { then(m) }
+            }.resume()
+        }
+        func backup() {
+            guard let secid = eastmoneySecid(key: key, market: mk, code: q.code) else { finish(nil); return }
+            get(host("https://push2his.eastmoney.com/") + "api/qt/stock/trends2/get?secid=\(secid)&fields1=f1,f2,f3&fields2=f51,f53,f56,f57,f58&ndays=1&iscr=0",
+                { parseEastmoneyMinutes($0) }, then: finish)
+        }
+
+        var path = "appstock/app/minute/query", code = key
+        if mk == .hk { path = "appstock/app/hkMinute/query"; code = String(key.dropFirst(2)) }        // r_hk00700 → hk00700
+        if mk == .us { path = "appstock/app/UsMinute/query"; code = "us" + q.code }                   // 美股要带交易所后缀（AAPL.OQ）
+        let enc = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
+        // 同一份数据有三个地址。挨个试，哪个被拦了就十分钟内跳过它（按「地址 + 接口」分别记，互不连累）
+        let bases = ["https://web.ifzq.gtimg.cn/", "https://ifzq.gtimg.cn/", "https://proxy.finance.qq.com/ifzqgtimg/"]
+        func attempt(_ i: Int) {
+            guard i < bases.count else { backup(); return }
+            let tag = bases[i] + path
+            if let until = blockedUntil[tag], Date() < until { attempt(i + 1); return }
+            get(host(bases[i]) + path + "?code=" + enc, { parseMinutes($0, code: code, market: mk) }) { [weak self] m in
+                if let m = m, !m.prices.isEmpty { finish(m); return }
+                self?.blockedUntil[tag] = Date().addingTimeInterval(600)
+                attempt(i + 1)
+            }
+        }
+        attempt(0)
+    }
+
+    func buildDetail(raw: String, q: Quote) -> Detail {
+        let key = apiSymbol(raw)
+        let mk = Market.of(key, type: q.str(61))
+        func yi(_ v: Double?) -> String? {      // 单位：亿
+            guard let v = v, v > 0 else { return nil }
+            if lang == "en" {       // 英文按 M / B / T 写
+                let b = v / 10
+                return b >= 1000 ? String(format: "%.2fT", b / 1000) : (b >= 1 ? String(format: b >= 100 ? "%.0fB" : "%.2fB", b) : String(format: "%.0fM", b * 1000))
+            }
+            return v >= 10000 ? String(format: "%.2f万亿", v / 10000) : String(format: v >= 100 ? "%.0f亿" : "%.2f亿", v)
+        }
+        func plain(_ i: Int, _ suffix: String = "") -> String? {
+            guard let v = q.num(i), v != 0 else { return nil }
+            return String(format: "%.2f", v) + suffix
+        }
+        func price(_ v: Double?) -> String? { (v ?? 0) > 0 ? fmt(v!) : nil }
+        var core: [Stat] = []
+        func add(_ id: String, _ label: String, _ value: String?) {
+            if let v = value { core.append(Stat(id: id, label: label, value: v)) }     // 这个市场没有的指标就不占位置
+        }
+        let isA = mk == .aStock || mk == .aIndex
+        let amount = q.num(37).map { isA ? $0 / 10000 : $0 / 1e8 }   // A 股给的是万元，港美股是元
+        // 只留四个最常用的数。估值、市值、涨跌停、盘口这些专业指标不放进来，这不是给交易员用的工具
+        add("open", T("今开", "Open"), price(q.open)); add("prev", T("昨收", "Prev"), price(q.prevClose))
+        add("amount", T("成交额", "Value"), yi(amount)); if mk != .hk, mk != .aIndex { add("turnover", T("换手", "Turnover"), plain(38, "%")) }
+        var buy = 0.0, sell = 0.0
+        if mk == .aStock { buy = q.num(7) ?? 0; sell = q.num(8) ?? 0 }          // 外盘 / 内盘，单位手
+
+        let st = mk.status(stamp: q.stamp)
+        var status = st.text
+        if mk == .us {       // 美股时间是美东时间，白天看到的是上一个交易日的数据，要说清楚
+            let f = DateFormatter(); f.timeZone = mk.zone; f.dateFormat = "M-d HH:mm"
+            status += q.stamp.map { T(" 美东 ", " ET ") + f.string(from: $0) } ?? ""
+        } else {
+            status += " " + q.time
+        }
+        let spark = minutes[key]
+        let total = mk.sessions.reduce(0) { $0 + $1.1 - $1.0 + 1 }
+        let notOpen = !st.live && q.stamp.map { Date().timeIntervalSince($0) > 3600 * 6 } ?? true      // 今天还没有行情
+        return Detail(name: displayName(q, key: key), code: q.code + (mk.currency.isEmpty ? "" : " · " + mk.currency), statusText: status, live: st.live,
+                      direction: q.dir, price: q.price, prevClose: q.prevClose, open: q.open, high: q.high, low: q.low,
+                      buy: buy, sell: sell, core: core, more: [],
+                      spark: spark ?? [], avg: [], vols: minuteVols[key] ?? [], times: minuteTimes[key] ?? [],
+                      chartNote: spark == nil ? T("加载中…", "Loading…") : (notOpen ? T("还没开盘", "Not open yet") : T("走势没取到", "Chart unavailable")),
+                      sessions: mk.sessions, sparkTotal: total)
+    }
+
+    /// 窗口变大变小后，鼠标可能已经不在（或已经在）小窗上却没收到进出事件，这里按实际位置校正
+    func syncHover() {
+        guard panel.isVisible else { return }
+        let inside = panel.frame.contains(NSEvent.mouseLocation)
+        guard inside != hovering else { return }
+        hovering = inside
+        applyConfig()
+        render()
+        scheduleAutoClose()
+    }
+
+    /// 把小窗平滑地过渡到目标大小，同时淡入 / 淡出详情区
+    func animate(to target: NSRect, detailAlpha: CGFloat, dip: Bool, done: @escaping () -> Void) {
+        if target == animTarget, detailAlpha == animAlphaTarget, !dip { return }   // 已经在去往这个状态的路上，或已经到了
+        animTarget = target
+        animAlphaTarget = detailAlpha
+        animTimer?.invalidate()
+        animTimer = nil
+        let from = panel.frame
+        // 没显示出来、或者只是挪位置不变大小（比如刚拖完），就不做动画
+        guard panel.isVisible, from.size != target.size || dip || board.detailAlpha != detailAlpha else {
+            resizing = true; panel.setFrame(target, display: true); resizing = false
+            board.detailAlpha = detailAlpha
+            done()
+            return
+        }
+        animDone = done
+        let fromAlpha: CGFloat = dip ? 0.25 : board.detailAlpha    // 切换股票时让详情轻轻淡入
+        let start = CACurrentMediaTime()
+        let duration = 0.16
+        let t = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            let p = min(1, (CACurrentMediaTime() - start) / duration)
+            let e = CGFloat(1 - pow(1 - p, 3))                     // 先快后慢
+            func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * e }
+            var f = target
+            if p < 1 {      // 右上角钉住不动，只让左边和下边伸缩
+                let maxX = mix(from.maxX, target.maxX).rounded(), maxY = mix(from.maxY, target.maxY).rounded()
+                let w = mix(from.width, target.width).rounded(), h = mix(from.height, target.height).rounded()
+                f = NSRect(x: maxX - w, y: maxY - h, width: w, height: h)
+            }
+            self.board.detailAlpha = mix(fromAlpha, detailAlpha)
+            self.resizing = true
+            self.panel.setFrame(f, display: true)
+            self.resizing = false
+            self.board.needsDisplay = true
+            if p >= 1 {
+                timer.invalidate()
+                self.animTimer = nil
+                let d = self.animDone; self.animDone = nil; d?()
+                self.syncHover()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        animTimer = t
+    }
+
+    /// 根据右上角锚点算出小窗该放哪。放不下时临时挪进屏幕（靠边时往里收，靠下时往上顶），锚点本身不变
+    func place(_ size: NSSize) -> NSRect {
+        let probe = NSPoint(x: anchorRight - 1, y: anchorTop - 1)
+        let screen = NSScreen.screens.first { $0.frame.contains(probe) } ?? NSScreen.main
+        guard let vf = screen?.visibleFrame else {
+            return NSRect(x: anchorRight - size.width, y: anchorTop - size.height, width: size.width, height: size.height)
+        }
+        let x = max(vf.minX + 4, min(anchorRight - size.width, vf.maxX - size.width - 4))
+        var top = min(anchorTop, vf.maxY - 2)
+        if top - size.height < vf.minY + 4 { top = min(vf.maxY - 2, vf.minY + 4 + size.height) }
+        return NSRect(x: x, y: top - size.height, width: size.width, height: size.height)
+    }
+
+    static let clockFormatter: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+
+    func statusText() -> String {
+        if let f = flashText { return f }
+        var parts: [String] = []
+        if configBad { parts.append(T("配置文件有误", "Config file error")) }
+        let f = AppDelegate.clockFormatter
+        if failed { parts.append(T("断线", "Offline")) }
+        if let t = lastOK { parts.append(f.string(from: t)) }
+        if cfg.stocks.count > maxStocks { parts.append(T("还有 \(cfg.stocks.count - maxStocks) 只没显示", "\(cfg.stocks.count - maxStocks) more not shown")) }
+        return parts.joined(separator: " · ")
+    }
+
+    func render() {
+        let list = shown
+        if let s = selected, !list.contains(s) { selected = nil }
+        var want = false
+        if !mini, let s = selected, let i = list.firstIndex(of: s), let q = quotes[apiSymbol(s)] {
+            board.detail = buildDetail(raw: s, q: q)
+            board.selectedRow = i
+            want = true
+            closing = false
+        } else {
+            board.selectedRow = nil
+            if board.detail != nil { closing = true }   // 内容先留着，等收起动画播完再清
+        }
+        var rows: [Row] = []
+        let blanks = expanded ? 8 : 0       // 更多列展开时，缺数据的行也补齐列数，免得错位
+        func pad(_ cells: [Cell]) -> [Cell] {
+            guard expanded else { return cells }
+            return cells + [Cell(text: "", right: true), Cell(text: "开", dim: true), Cell(text: "—", right: true),
+                            Cell(text: "高", dim: true), Cell(text: "—", right: true),
+                            Cell(text: "低", dim: true), Cell(text: "—", right: true), Cell(text: "", right: true, dim: true)].prefix(blanks)
+        }
+        for raw in list {
+            let alias = cfg.aliases[raw]
+            guard isValidCode(raw) else {
+                rows.append(Row(cells: pad([Cell(text: alias ?? raw), Cell(text: "", right: true), Cell(text: T("代码有误", "Bad ticker"), right: true, dim: true)]), direction: 0))
+                continue
+            }
+            guard let q = quotes[apiSymbol(raw)] else {
+                rows.append(Row(cells: pad([Cell(text: alias ?? raw), Cell(text: "", right: true),
+                                            Cell(text: everLoaded ? T("无数据", "No data") : "—", right: true, dim: true)]), direction: 0))
+                continue
+            }
+            let label = alias ?? (cfg.label == "code" ? raw : displayName(q, key: apiSymbol(raw)))
+            guard q.live else {      // 开盘前 / 停牌：现价是 0，只显示昨收，不算涨跌
+                rows.append(Row(cells: pad([Cell(text: label), Cell(text: fmtP(q.prevClose), right: true, dim: true),
+                                            Cell(text: "—", right: true, dim: true)]), direction: 0))
+                continue
+            }
+            var cells = [Cell(text: label),
+                         Cell(text: fmt(q.price), right: true, tint: true),
+                         Cell(text: String(format: "%+.2f%%", q.pct), right: true, tint: true)]
+            if expanded {
+                cells += [Cell(text: String(format: "%+.2f", q.change), right: true, tint: true),
+                          Cell(text: "开", dim: true), Cell(text: fmtP(q.open), right: true),
+                          Cell(text: "高", dim: true), Cell(text: fmtP(q.high), right: true),
+                          Cell(text: "低", dim: true), Cell(text: fmtP(q.low), right: true),
+                          Cell(text: q.time, right: true, dim: true)]
+            }
+            rows.append(Row(cells: cells, direction: q.dir))
+        }
+        if rows.isEmpty { rows = [Row(cells: [Cell(text: T("点 + 添加", "Click + to add"), dim: true, whole: true)], direction: 0)] }
+
+        let ids = tabIDs
+        if !ids.contains(tab), let f = ids.first { tab = f }
+        board.tabs = ids.count > 1 ? ids.map { AppDelegate.tabNames[$0] ?? $0 } : []
+        board.tabIndex = ids.firstIndex(of: tab) ?? 0
+        board.greenUp = tab == "us" ? cfg.usGreenUp : cfg.upColor == "green"
+        board.expanded = expanded
+        board.showMore = detailMore
+        board.mini = mini
+        board.status = statusText()
+        board.rows = rows
+        let target = place(board.size(withDetail: want))
+        let switched = want && lastDetailKey != nil && lastDetailKey != selected
+        lastDetailKey = want ? selected : nil
+        animate(to: target, detailAlpha: want ? 1 : 0, dip: switched) { [weak self] in
+            guard let self = self, self.closing else { return }
+            self.closing = false
+            self.board.detail = nil
+            self.board.needsDisplay = true
+        }
+        // 详情展开时保持清晰，不然 35% 透明度下看不清数字
+        let alpha = CGFloat(hovering || want || board.page != .list ? cfg.hoverOpacity : (mini ? max(cfg.opacity, 0.8) : cfg.opacity))
+        if abs(panel.alphaValue - alpha) > 0.001 {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.12
+                panel.animator().alphaValue = alpha
+            }
+        }
+        board.needsDisplay = true
+        syncKeyboard()
+    }
+}
+
+// MARK: - 自检（./CheerUp --selftest）
+
+func selfTest() -> Int32 {
+    var fails = 0, n = 0
+    func check(_ name: String, _ ok: Bool) { n += 1; if !ok { fails += 1; print("FAIL  \(name)") } }
+    // 代码识别
+    for (a, b) in [("600519", "sh600519"), ("000858", "sz000858"), ("000333", "sz000333"), ("688981", "sh688981"),
+                   ("510300", "sh510300"), ("159915", "sz159915"), ("830799", "bj830799"), ("920001", "bj920001"),
+                   ("00700", "r_hk00700"), ("700", "r_hk00700"), ("hk00700", "r_hk00700"), ("hkHSI", "r_hkHSI"),
+                   ("AAPL", "usAAPL"), ("aapl", "usAAPL"), ("BRK.B", "usBRK.B"), ("SHOP", "usSHOP"),
+                   ("sh000001", "sh000001"), ("usNVDA", "usNVDA"), (".IXIC", "us.IXIC")] {
+        check("apiSymbol \(a)", apiSymbol(a) == b)
+    }
+    check("合法代码", isValidCode("600519") && isValidCode("BRK.B") && isValidCode("sh000001"))
+    check("非法代码", !isValidCode("茅台") && !isValidCode("AA PL") && !isValidCode("") && !isValidCode("a&b=1") && !isValidCode(String(repeating: "A", count: 40)))
+    // 行情解析
+    func line(_ key: String, price: String, prev: String) -> String {
+        var f = Array(repeating: "0", count: 50)
+        f[1] = "测试"; f[2] = "000001"; f[3] = price; f[4] = prev; f[5] = "10.00"; f[30] = "20261125104627"; f[33] = "11.00"; f[34] = "9.00"
+        return "v_\(key)=\"" + f.joined(separator: "~") + "\";"
+    }
+    let q1 = parseQuotes(line("sz000001", price: "10.50", prev: "10.00"))["sz000001"]
+    check("正常行情", q1 != nil && abs(q1!.pct - 5) < 1e-9 && q1!.dir == 1 && q1!.time == "10:46")
+    let q0 = parseQuotes(line("sz000001", price: "0.00", prev: "10.00"))["sz000001"]
+    check("现价为 0 不算跌 100%", q0 != nil && !q0!.live && q0!.pct == 0 && q0!.dir == 0 && q0!.change == 0)
+    check("垃圾响应不崩", parseQuotes("v_pv_none_match=\"1\";").isEmpty && parseQuotes("").isEmpty && parseQuotes("<html>502</html>").isEmpty)
+    check("字段不够不崩", parseQuotes("v_sh1=\"1~a~b~1.0\";").isEmpty)
+    // 配置
+    func cfg(_ json: String) -> Config? { decodeConfig(json.data(using: .utf8)!) }
+    check("空对象用默认值", cfg("{}")?.refreshSeconds == 3)
+    check("坏 JSON 返回 nil", cfg("{ \"stocks\": [\"600519\", }") == nil)
+    check("弯引号返回 nil", cfg("{ “stocks”: [] }") == nil)
+    check("类型写错返回 nil", cfg("{ \"fontSize\": \"大\" }") == nil)
+    let c = cfg("{ \"opacity\": 0, \"hoverOpacity\": 0, \"fontSize\": 200, \"refreshSeconds\": 0.01, \"theme\": \"pink\", \"stocks\": [\" 600519 \", \"\"] }")
+    check("越界数值被拉回", c != nil && c!.opacity >= 0.08 && c!.hoverOpacity >= 0.3 && c!.fontSize == 22 && c!.refreshSeconds == 2 && c!.theme == "dark" && c!.stocks == ["600519"])
+    let hits = parseSearch("v_hint=\"sh~600519~\\u8d35\\u5dde\\u8305\\u53f0~gzmt~GP-A^jj~007005~x~y~KJ^hk~00700~\\u817e\\u8baf\\u63a7\\u80a1~txkg~GP^us~aapl.oq~\\u82f9\\u679c~pg~GP^sh~000001~\\u4e0a\\u8bc1\\u6307\\u6570~szzs~ZS\"")
+    check("搜索解析", hits.map { $0.code } == ["600519", "hk00700", "usAAPL", "sh000001"] && hits.first?.name == "贵州茅台" && hits.last?.tag == "指数")
+    check("搜索无结果", parseSearch("v_hint=\"N\";").isEmpty && parseSearch("").isEmpty && parseSearch("<html>501</html>").isEmpty)
+    let h2 = parseSearch("v_hint=\"us~brk.b.n~x~y~GP^us~ixic~n~y~ZS^hk~80700~tencent r~y~GP^hk~13005~w~y~QZ^us~tcehy.ps~t adr~y~GP\"")
+    check("美股分类股与指数代码", h2.map { $0.code } == ["usBRK.B", "us.IXIC", "usTCEHY"])
+    let h3 = parseSearch("v_hint=\"jj~000001~f~y~KJ^sz~000700~a~y~GP-A^hk~00700~b~y~GP^sh~600700~c~y~GP-A\"", query: "700")
+    check("代码完全一致的排最前", h3.first?.code == "hk00700" && h3.count == 3)
+    check("只看指定市场", parseSearch("v_hint=\"sh~000001~i~y~ZS^sz~000001~b~y~GP-A\"", query: "000001", market: "sz").map { $0.code } == ["000001"])
+    check("常用指数的口头叫法", indexHits("恒生", market: nil).map { $0.code } == ["hkHSI", "hkHSTECH"] && indexHits("纳指", market: nil).first?.code == "us.IXIC"
+          && indexHits("s&p", market: nil).first?.code == "us.INX" && indexHits("茅台", market: nil).isEmpty && indexHits("恒", market: nil).isEmpty)
+    check("输入清洗", cleanQuery("  茅 台 ")?.q == "茅台" && cleanQuery("ＡＡＰＬ")?.q == "AAPL" && cleanQuery("apple   inc")?.q == "apple inc"
+          && cleanQuery("<script>'\"%")?.q == "script" && cleanQuery("'\"%<>") == nil && cleanQuery("   ") == nil)
+    check("带市场前缀的输入", cleanQuery("sh600519")?.market == "sh" && cleanQuery("sh600519")?.q == "600519" && cleanQuery("hk00700")?.q == "00700"
+          && cleanQuery("usAAPL")?.q == "AAPL" && cleanQuery("us.IXIC")?.q == "IXIC" && cleanQuery("usb")?.market == nil && cleanQuery("shop")?.market == nil && cleanQuery("hkHSI")?.q == "HSI")
+    check("代码兜底的候选", codeCandidates("600519") == ["sh600519", "sz600519", "bj600519"] && codeCandidates("700") == ["r_hk00700"] && codeCandidates("aapl") == ["usAAPL"]
+          && codeCandidates("brk.b") == ["usBRK.B"] && codeCandidates("茅台").isEmpty && codeCandidates("1234567").isEmpty)
+    check("行数上限", cfg("{ \"maxVisibleRows\": 999 }")?.maxVisibleRows == 20 && cfg("{ \"maxVisibleRows\": 0 }")?.maxVisibleRows == 3)
+    check("重复代码去重", cfg("{ \"stocks\": [\"600519\", \"sh600519\", \"600519\", \"AAPL\", \"aapl\"] }")?.stocks == ["600519", "AAPL"])
+    // 市场状态（用固定时刻验证：2026-11-25 是周三）
+    func at(_ s: String, _ zone: String) -> Date {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(identifier: zone); f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.date(from: s)!
+    }
+    let sh = "Asia/Shanghai", ny = "America/New_York"
+    check("A股 交易中", Market.aStock.status(now: at("2026-11-25 10:00", sh), stamp: at("2026-11-25 09:59", sh)).text == "交易中")
+    check("A股 午休", Market.aStock.status(now: at("2026-11-25 12:00", sh), stamp: nil).text == "午休")
+    check("英文状态", { lang = "en"; defer { lang = "zh" }; return Market.us.status(now: at("2026-11-25 08:00", ny), stamp: nil).text == "Pre-market" && Market.aStock.status(now: at("2026-11-25 12:00", sh), stamp: nil).text == "Lunch break" }())
+    check("A股 集合竞价", Market.aStock.status(now: at("2026-11-25 09:20", sh), stamp: nil).text == "集合竞价")
+    check("A股 已收盘", Market.aStock.status(now: at("2026-11-25 15:30", sh), stamp: nil).text == "已收盘")
+    check("A股 周末", Market.aStock.status(now: at("2026-11-28 10:00", sh), stamp: nil).text == "休市")
+    check("A股 节假日（工作日但没有新行情）", Market.aStock.status(now: at("2026-11-25 10:00", sh), stamp: at("2026-11-24 15:00", sh)).text == "休市")
+    check("港股 下午 15:30 还在交易", Market.hk.status(now: at("2026-11-25 15:30", sh), stamp: at("2026-11-25 15:29", sh)).live)
+    check("美股 北京白天是已收盘", Market.us.status(now: at("2026-11-25 11:00", sh), stamp: at("2026-11-24 16:00", ny)).text == "已收盘")
+    check("美股 北京晚上 23 点交易中", Market.us.status(now: at("2026-11-25 23:00", sh), stamp: at("2026-11-25 09:59", ny)).text == "交易中")
+    check("美股 盘前", Market.us.status(now: at("2026-11-25 08:00", ny), stamp: nil).text == "盘前")
+    check("市场识别", Market.of("sh600519") == .aStock && Market.of("sh000001", type: "ZS") == .aIndex && Market.of("r_hk00700") == .hk && Market.of("usAAPL") == .us)
+    let us = parseQuotes(line("usAAPL", price: "354.07", prev: "349.08").replacingOccurrences(of: "20261125104627", with: "2026-11-24 16:00:02"))["usAAPL"]
+    check("美股时间按美东解析", us?.stamp == at("2026-11-24 16:00", ny).addingTimeInterval(2) && us?.time == "16:00")
+    let md = parseMinutes(Data("{\"data\":{\"sz1\":{\"data\":{\"data\":[\"0930 10.00 100 100000.00\",\"0931 10.20 300 303000.00\",\"0932 0 300 303000\"]}}}}".utf8), code: "sz1", market: .aStock)
+    check("分时解析与均价", md.prices == [10.0, 10.2] && md.vols == [100, 200] && md.avg.count == 2 && abs(md.avg[1] - 10.1) < 1e-9)
+    let mu = parseMinutes(Data("{\"data\":{\"usA.OQ\":{\"data\":{\"data\":[\"0930 346.09 1112947\",\"0931 346.10 1873392\"]}}}}".utf8), code: "usA.OQ", market: .us)
+    check("美股分时没有均价", mu.prices.count == 2 && mu.avg.isEmpty)
+    check("分时垃圾响应", parseMinutes(Data("<!DOCTYPE html>".utf8), code: "x", market: .us).prices.isEmpty)
+    let em = parseEastmoneyMinutes(Data("{\"data\":{\"trends\":[\"2026-11-25 09:30,44.88,3990,17906536.00,44.880\",\"2026-11-25 09:31,45.00,15159,68226339.00,44.982\"]}}".utf8))
+    check("备用分时源解析", em.prices == [44.88, 45.0] && em.vols == [3990, 15159] && em.times == ["0930", "0931"] && em.avg.count == 2)
+    check("备用源编号", eastmoneySecid(key: "sh600519", market: .aStock, code: "600519") == "1.600519" && eastmoneySecid(key: "sz000858", market: .aStock, code: "000858") == "0.000858"
+          && eastmoneySecid(key: "r_hk00700", market: .hk, code: "00700") == "116.00700" && eastmoneySecid(key: "usAAPL", market: .us, code: "AAPL.OQ") == "105.AAPL"
+          && eastmoneySecid(key: "r_hkHSI", market: .hk, code: "HSI") == nil)
+    check("分页归属", AppDelegate.tabOf("600519") == "a" && AppDelegate.tabOf("sh000001") == "a" && AppDelegate.tabOf("00700") == "hk" && AppDelegate.tabOf("hkHSI") == "hk"
+          && AppDelegate.tabOf("AAPL") == "us" && AppDelegate.tabOf("us.IXIC") == "us" && AppDelegate.tabOf("茅台") == "a")
+    check("动作首尾相接", cheerPose(at: 0).aL == -50 && cheerPose(at: 0.41) == Pose() && cheerPose(at: cheerRoutineLength - 0.001).aL < -49 && cheerRoutineLength > 5)
+    check("小人大小", cfg("{}")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"huge\" }")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"l\" }")?.mascotSize == "l")
+    check("花球颜色", cfg("{}")?.pomColor == "auto" && cfg("{ \"pomColor\": \"pink\" }")?.pomColor == "auto" && cfg("{ \"pomColor\": \"green\" }")?.pomColor == "green")
+    check("作息设置", cfg("{}")?.restSchedule == "auto" && cfg("{ \"restSchedule\": \"never\" }")?.restSchedule == "never" && cfg("{ \"restSchedule\": \"x\" }")?.restSchedule == "auto")
+    check("价格格式", fmt(0.5) == "0.500" && fmt(12.345) == "12.35" && fmtP(0) == "—")
+    print(fails == 0 ? "PASS  \(n) 项自检全部通过" : "\(fails)/\(n) 项失败")
+    return fails == 0 ? 0 : 1
+}
+
+if CommandLine.arguments.contains("--selftest") { exit(selfTest()) }
+if let i = CommandLine.arguments.firstIndex(of: "--film"), i + 3 < CommandLine.arguments.count {
+    // 调试用：不开任何窗口，把拉拉队在一段时间里的每一帧画成一张连环画。./CheerUp --film 起始秒 结束秒 步长 输出.png
+    let a = CommandLine.arguments
+    let t0 = Double(a[i + 1])!, t1 = Double(a[i + 2])!, dt = Double(a[i + 3])!, path = a[i + 4]
+    let side: CGFloat = 132, n = Int(((t1 - t0) / dt).rounded()) + 1, cols = min(n, 12), rowsN = (n + cols - 1) / cols
+    let view = BoardView(frame: NSRect(x: 0, y: 0, width: side, height: side))
+    view.mini = true
+    let sheet = NSImage(size: NSSize(width: CGFloat(cols) * side, height: CGFloat(rowsN) * side))
+    sheet.lockFocus()
+    for k in 0..<n {
+        let r = NSRect(x: CGFloat(k % cols) * side, y: CGFloat(rowsN - 1 - k / cols) * side, width: side, height: side)
+        (k / cols % 2 == 0 ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill(); r.fill()      // 一行深底、一行浅底
+        view.pose = cheerPose(at: t0 + dt * Double(k))
+        let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+        view.cacheDisplay(in: view.bounds, to: rep)
+        rep.draw(in: r)
+    }
+    sheet.unlockFocus()
+    if let t = sheet.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)) }
+    exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--search") {       // 调试用：./CheerUp --search 关键词…  逐个跑完整搜索并打印
+    let d = AppDelegate()
+    var rest = Array(CommandLine.arguments[(i + 1)...])
+    func next() {
+        guard !rest.isEmpty else { exit(0) }
+        let raw = rest.removeFirst()
+        guard let (q, m) = cleanQuery(raw) else { print("「\(raw)」 → （无可搜内容）"); next(); return }
+        d.runSearch(q, market: m, shown: raw) { hits, foot in
+            print("「\(raw)」 → " + hits.prefix(6).map { "\($0.name)(\($0.code) \($0.tag))" }.joined(separator: " | ") + "  ［\(foot)］")
+            next()
+        }
+    }
+    next()
+    RunLoop.main.run()
+}
+if let i = CommandLine.arguments.firstIndex(of: "--baricon"), i + 1 < CommandLine.arguments.count {     // 调试用：把顶部栏图标存成图片
+    let big = NSImage(size: NSSize(width: 144, height: 144), flipped: false) { r in NSColor.white.setFill(); r.fill(); AppDelegate.barIcon().draw(in: r); return true }
+    if let t = big.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1])) }
+    exit(0)
+}
+
+// 已经有一个在跑就不再开第二个（否则两个小窗叠在一起，快捷键也会打架）
+if testHome == nil, let bid = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: bid).contains(where: { $0 != NSRunningApplication.current }) {
+    DistributedNotificationCenter.default().postNotificationName(Notification.Name("local.cheerup.show"), object: nil, userInfo: nil, deliverImmediately: true)
+    exit(0)
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
