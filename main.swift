@@ -30,6 +30,7 @@ struct Config: Decodable {
     var miniStyle: String = "cheer"          // 收起后的样子：cheer 啦啦队员 / face 笑脸
     var language: String = ""                // 界面语言：zh / en；空着表示还没选，先跟系统
     var tabOrder: [String] = ["a", "hk", "us"]      // 市场标签从左到右的顺序
+    var mascotOnBoard: Bool = true           // 展开面板时拉拉队还站不站在上面；关掉后展开只有面板，收起还是拉拉队
     var uiSize: String = "m"                 // 面板整体大小：s / m / l / xl（文字、间距、图标一起等比放大）
     var mascotSize: String = "m"             // 收起后小人的大小：s / m / l
     var restSchedule: String = "auto"        // 小人什么时候休息：auto 跟随当前标签页的市场 / a / hk / us / never 永不休息
@@ -39,7 +40,7 @@ struct Config: Decodable {
 
     enum Keys: String, CodingKey {
         case stocks, aliases, refreshSeconds, opacity, hoverOpacity, fontSize
-        case color, theme, label, menuBarIcon, hideFromScreenShare, detailAutoCloseSeconds, maxVisibleRows, upColor, usGreenUp, miniStyle, language, mascotSize, tabOrder, uiSize, pomColor, restSchedule
+        case color, theme, label, menuBarIcon, hideFromScreenShare, detailAutoCloseSeconds, maxVisibleRows, upColor, usGreenUp, miniStyle, language, mascotSize, tabOrder, uiSize, mascotOnBoard, pomColor, restSchedule
     }
 
     init(from decoder: Decoder) throws {
@@ -65,6 +66,7 @@ struct Config: Decodable {
         mascotSize = try c.decodeIfPresent(String.self, forKey: .mascotSize) ?? d.mascotSize
         tabOrder = (try? c.decodeIfPresent([String].self, forKey: .tabOrder)) ?? d.tabOrder
         uiSize = try c.decodeIfPresent(String.self, forKey: .uiSize) ?? d.uiSize
+        mascotOnBoard = try c.decodeIfPresent(Bool.self, forKey: .mascotOnBoard) ?? d.mascotOnBoard
         pomColor = try c.decodeIfPresent(String.self, forKey: .pomColor) ?? d.pomColor
         restSchedule = try c.decodeIfPresent(String.self, forKey: .restSchedule) ?? d.restSchedule
     }
@@ -1001,6 +1003,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
     }
     var fold: CGFloat?                  // 面板正在收成拉拉队脚下那道横线：0 刚开始，1 收完；nil = 没在收
     var foldScale: CGFloat = 1          // 面板整体放大的倍数
+    var foldTop: CGFloat = 76           // 面板上沿离窗口顶多远（拉拉队不站在面板上时是 0）
     var foldSide: CGFloat = 88          // 拉拉队那一块的边长，用来算横线最后落在哪
     var gaze = NSPoint.zero             // 眼睛往哪边看（-1…1）：鼠标停在它身上时看向鼠标
     private var stableW: [Bool: CGFloat] = [:]   // 每种模式用过的最大宽度，只增不减，避免数字位数变化时抖动
@@ -1020,7 +1023,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
     private var smallFont: NSFont { .monospacedDigitSystemFont(ofSize: max(CGFloat(cfg.fontSize) - 2.5, 7), weight: .regular) }
 
     /// 按钮从左往右：添加、菜单、收成笑脸、隐藏
-    private var btnCount: Int { cfg.miniStyle == "face" ? 4 : 3 }      // 有拉拉队时「隐藏」搬到了它头边，标题条只剩三个
+    private var btnCount: Int { cfg.miniStyle == "face" || !cfg.mascotOnBoard ? 4 : 3 }      // 有拉拉队时「隐藏」搬到了它头边，标题条只剩三个
     private func btnRect(_ i: Int) -> NSRect {
         let right = bounds.width - 5
         return NSRect(x: right - btnW * CGFloat(btnCount - i), y: headerTop, width: btnW, height: headerH)     // 等宽、等距
@@ -1931,7 +1934,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.saveGraphicsState(); defer { NSGraphicsContext.restoreGraphicsState() }
         let zoom = NSAffineTransform(); zoom.scale(by: 1 / foldScale); zoom.concat()
         let bw = bounds.width * foldScale, bh = bounds.height * foldScale
-        let u = foldSide / 38, sw = pow(u, 0.85), top = floor(foldSide * 33.0 / 38)
+        let u = foldSide / 38, sw = pow(u, 0.85), top = foldTop
         // 终点：小人脚下那道横线（13.5–24.5、y 33.4，灰色本体 1.5 粗，外面一圈深色描边），换算到这块视图里
         let x0 = bw - foldSide + 13.5 * u, x1 = bw - foldSide + 24.5 * u, cy = 33.4 * u - top
         let outerEnd = NSRect(x: x0 - 1.5 * sw, y: cy - 1.5 * sw, width: x1 - x0 + 3 * sw, height: 3 * sw)
@@ -2383,14 +2386,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var cheerStyle: Bool { cfg.miniStyle != "face" }
     var uiScale: CGFloat { ["s": 0.9, "l": 1.2, "xl": 1.4][cfg.uiSize] ?? 1 }
     var mascotSide: CGFloat { ["s": 68, "l": 112][cfg.mascotSize] ?? 88 }
-    var stageTop: CGFloat { cheerStyle ? floor(mascotSide * 33.0 / 38) : 0 }
+    var stageTop: CGFloat { cheerStyle && cfg.mascotOnBoard ? floor(mascotSide * 33.0 / 38) : 0 }
+    /// 现在屏幕上有没有拉拉队：收起时一定有；展开时看设置（收起的过渡途中也算有，它是从面板缩成的横线上站出来的）
+    var mascotVisible: Bool { cheerStyle && (mini || folding || cfg.mascotOnBoard) }
+    var unfolding = false            // 拉拉队不站在面板上时的展开：脚下的横线先展开成面板的底板
     /// 拉拉队那一块在屏幕上的位置：始终是窗口的右上角
     var mascotScreenRect: NSRect { let f = panel.frame, m = mascotSide; return NSRect(x: f.maxX - m, y: f.maxY - m, width: m, height: m) }
     /// 鼠标是不是在看得见的东西上（面板或拉拉队）；窗口左上那块透明的空白不算
     func mouseInside() -> Bool {
         let m = NSEvent.mouseLocation, f = panel.frame
         guard cheerStyle else { return f.contains(m) }
-        if mascotScreenRect.contains(m) { return true }
+        if mascotVisible, mascotScreenRect.contains(m) { return true }
         if bubbleOpen, let w = bubble.window, w.convertToScreen(bubble.convert(bubble.bounds, to: nil)).contains(m) { return true }
         return !mini && NSRect(x: f.minX, y: f.minY, width: f.width, height: max(0, f.height - stageTop)).contains(m)
     }
@@ -2905,6 +2911,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if swapStart > 0, !swapState(min((now - swapStart) / swapSeconds, 1)).found { mc.pomColor = mascot.cfg.pomColor }
         }
         mascot.cfg = mc
+        if !mascotVisible, bubbleOpen { bubbleOpen = false; bubble.isHidden = true }
+        if cheerTimer != nil || mascotVisible { DispatchQueue.main.async { [weak self] in self?.updateCheer() } }
         UI.theme = cfg.theme; UI.fontSize = CGFloat(cfg.fontSize); UI.color = cfg.color
         lang = cfg.language.isEmpty ? systemLang() : cfg.language
         // 默认截图和屏幕共享里都能看到；配置里打开 hideFromScreenShare 后只有鼠标停在上面时才看得到
@@ -3028,6 +3036,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rows.append(PRow(sep: true))
         // 第二组：拉拉队（大小、花球、作息）
         if cfg.miniStyle != "face" {
+            setting("onboard", T("展开时显示拉拉队", "Cheerleader when open"), current: cfg.mascotOnBoard ? "on" : "off",
+                    options: [("on", T("开", "On")), ("off", T("关", "Off"))]) { [weak self] v in
+                _ = self?.mutateConfigObject { $0["mascotOnBoard"] = (v == "on") }
+            }
             setting("size", T("拉拉队大小", "Cheerleader size"), current: cfg.mascotSize,
                     options: [("s", T("小", "Small")), ("m", T("中", "Medium")), ("l", T("大", "Large"))]) { [weak self] v in
                 _ = self?.mutateConfigObject { $0["mascotSize"] = v }
@@ -3386,7 +3398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 收起并且看得见的时候才播动作；展开、隐藏时停掉节拍，不白耗电
     func updateCheer() {
         defer { syncBubbleKey() }
-        let run = panel.isVisible && cheerStyle && ProcessInfo.processInfo.environment["PEEK_CHEER_T"] == nil
+        let run = panel.isVisible && mascotVisible && ProcessInfo.processInfo.environment["PEEK_CHEER_T"] == nil
         if !run {
             if bubbleOpen { bubbleOpen = false; bubble.isHidden = true }       // 小窗藏起来时气泡也跟着收，不然再叫出来时它还开着
             cheerTimer?.invalidate(); cheerTimer = nil; return
@@ -3410,10 +3422,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 鼠标在它周围一圈（不必正好压在身上）就算在看它
         // 展开时，鼠标在面板上也算在看它：它会停下来，眼睛跟着鼠标在面板上走
         let mr = mascotScreenRect
-        var near = mr.insetBy(dx: -34, dy: -34).contains(NSEvent.mouseLocation) || (!mini && mouseInside())
+        var near = (mascotVisible && mr.insetBy(dx: -34, dy: -34).contains(NSEvent.mouseLocation)) || (!mini && mouseInside())
         if near { lastNearAt = now }
         // 鼠标在拉拉队身上停一小会儿，它旁边就冒出气泡；鼠标离开它和气泡一会儿，气泡自己收起来
-        let onMascot = mascotScreenRect.contains(NSEvent.mouseLocation)
+        let onMascot = mascotVisible && mascotScreenRect.contains(NSEvent.mouseLocation)
         if !onMascot { bubbleHoverAt = 0; bubbleMuted = false }
         else if bubbleHoverAt == 0 { bubbleHoverAt = now }
         // 按着鼠标（点它、拖它）的时候不出气泡；已经出来的马上藏掉，窗口等松手再缩
@@ -3541,7 +3553,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mini.toggle()
         store.set(mini, forKey: "mini")
         folding = mini && cheerStyle && panel.isVisible && !board.isHidden       // 收起时播一小段：面板缩成脚下的横线
-        if !folding { board.fold = nil }
+        unfolding = !mini && cheerStyle && !cfg.mascotOnBoard && panel.isVisible    // 拉拉队不上面板：展开时反过来，横线展开成面板
+        board.fold = unfolding ? 1 : nil
         if mini { closePage(); selected = nil; board.detail = nil; closing = false }
         if !panel.isVisible { panel.orderFrontRegardless() }
         render()
@@ -3761,6 +3774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 把小窗平滑地过渡到目标大小，同时淡入 / 淡出详情区
     /// 收起的那一小段播完：面板藏起来，脚下换回拉拉队自己的横线
     func endFold() {
+        if unfolding { unfolding = false; board.fold = nil; board.needsDisplay = true }
         guard folding else { return }
         folding = false
         board.fold = nil
@@ -3787,7 +3801,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         animDone = done
         let fromAlpha: CGFloat = dip ? 0.25 : board.detailAlpha    // 切换股票时让详情轻轻淡入
         let start = CACurrentMediaTime()
-        let duration = folding ? 0.2 : (board.isHidden || from.height <= mascotSide + 1 ? 0.2 : 0.16)      // 收起、展开慢一点，看得清它怎么变的
+        let duration = folding || unfolding ? 0.2 : (board.isHidden || from.height <= mascotSide + 1 ? 0.2 : 0.16)      // 收起、展开慢一点，看得清它怎么变的
         let t = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             let p = min(1, (CACurrentMediaTime() - start) / duration)
@@ -3800,8 +3814,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 f = NSRect(x: maxX - w, y: maxY - h, width: w, height: h)
             }
             self.board.detailAlpha = mix(fromAlpha, detailAlpha)
-            if self.folding { self.board.fold = e }
-            if self.folding, let stop = self.debugFold, p >= stop { timer.invalidate(); self.animTimer = nil; print("fold stopped at \(p) frame=\(self.panel.frame.size)"); fflush(stdout); return }
+            if self.folding { self.board.fold = e; if !self.cfg.mascotOnBoard { let hide = e < 0.92; if self.mascot.isHidden != hide { self.mascot.isHidden = hide } } }
+            if self.unfolding { self.board.fold = 1 - e }
+            if self.folding || self.unfolding, let stop = self.debugFold, p >= stop { timer.invalidate(); self.animTimer = nil; print("fold stopped at \(p) frame=\(self.panel.frame.size)"); fflush(stdout); return }
             self.resizing = true
             self.panel.setFrame(f, display: true)
             self.resizing = false
@@ -3907,7 +3922,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         board.isHidden = cheerStyle && mini && !folding
         board.foldSide = mascotSide
         if folding, board.fold == nil { board.fold = 0 }
-        mascot.isHidden = !cheerStyle
+        // 拉拉队不站在面板上时的收起：等面板缩到它脚下那么小了它才出现，不然会被还没缩完的底板盖住半截
+        mascot.isHidden = !mascotVisible || (folding && !cfg.mascotOnBoard && (board.fold ?? 0) < 0.92)
         if mascot.greenUp != board.greenUp {
             // 花球跟着市场变色时，不是直接换颜色：背过手去换一副（cheerTick 里做）
             if cfg.pomColor == "auto", cfg.color, cheerTimer != nil, !mascot.isHidden { if swapStart == 0 { swapStart = CACurrentMediaTime() } }
@@ -3915,7 +3931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let standing = !mini || folding
         if mascot.onBoard != standing { mascot.onBoard = standing; mascot.needsDisplay = true }
-        stage.side = mascotSide; stage.top = stageTop; stage.scale = uiScale; board.foldScale = uiScale
+        stage.side = mascotSide; stage.top = stageTop; stage.scale = uiScale; board.foldScale = uiScale; board.foldTop = stageTop
         board.status = statusText()
         board.rows = rows
         var size = board.size(withDetail: want)
@@ -4031,6 +4047,7 @@ func selfTest() -> Int32 {
           && AppDelegate.tabOf("AAPL") == "us" && AppDelegate.tabOf("us.IXIC") == "us" && AppDelegate.tabOf("茅台") == "a")
     check("动作首尾相接", cheerPose(at: 0).aL == -50 && cheerPose(at: 0.41) == Pose() && cheerPose(at: cheerRoutineLength - 0.001).aL < -49 && cheerRoutineLength > 5)
     check("标签顺序", cfg("{}")?.tabOrder == ["a", "hk", "us"] && cfg("{ \"tabOrder\": [\"us\", \"x\", \"us\"] }")?.tabOrder == ["us", "a", "hk"])
+    check("展开时显示拉拉队", cfg("{}")?.mascotOnBoard == true && cfg("{ \"mascotOnBoard\": false }")?.mascotOnBoard == false)
     check("界面大小", cfg("{}")?.uiSize == "m" && cfg("{ \"uiSize\": \"xl\" }")?.uiSize == "xl" && cfg("{ \"uiSize\": \"huge\" }")?.uiSize == "m")
     check("小人大小", cfg("{}")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"huge\" }")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"l\" }")?.mascotSize == "l")
     check("花球颜色", cfg("{}")?.pomColor == "auto" && cfg("{ \"pomColor\": \"pink\" }")?.pomColor == "auto" && cfg("{ \"pomColor\": \"green\" }")?.pomColor == "green")
