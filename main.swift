@@ -2017,7 +2017,6 @@ final class BoardView: NSView, NSTextFieldDelegate {
             body.move(to: pt(19, hipY)); body.line(to: pt(ax, ay))
             body.line(to: pt(ax + side * cos(ft) * fl, ay + sin(ft) * fl))
         }
-        stroke(body, 2.2, ink)                       // 最底下一层：躯干和腿
         // 手臂和花球的路径先算好，等脑袋画完再画，这样举起来时手和花球在脑袋前面
         var hands: [NSPoint] = []
         let arms = NSBezierPath()
@@ -2050,6 +2049,14 @@ final class BoardView: NSView, NSTextFieldDelegate {
                 star.line(to: NSPoint(x: cx + cos(a) * len, y: cy + sin(a) * len))
             }
         }
+
+        // 手背到身后时（换花球）：手臂和花球真的在身体后面，先画它们，再画躯干和腿盖上去
+        let armsBehind = behind > 0.5
+        if armsBehind {
+            stroke(arms, 2.2, ink)
+            if behind < 0.95 { stroke(star, 2.0, accent) }
+        }
+        stroke(body, 2.2, ink)                       // 躯干和腿
 
         // 睡着时的 z：漫画里那种一串斜体小 z，从头边冒出来，越飘越高、越大，然后淡掉。线很细，不抢戏
         if p.z > 0 {
@@ -2144,19 +2151,15 @@ final class BoardView: NSView, NSTextFieldDelegate {
             f.stroke()
         }
 
-        // 最上面两层：手臂，然后花球
-        stroke(arms, 2.2, ink)
-        let patch = NSBezierPath()                 // 手臂的描边会在肩膀处横切过躯干，用一小段躯干本体盖回去
-        let neckT = 1.9 / max(hipY - 14.4 - p.hop, 0.1)
-        patch.move(to: pt(19 + p.lean * (1 - neckT), 16.3 + p.hop)); patch.line(to: pt(19, hipY))       // 盖整段躯干：只盖肩膀那一小截的话，剩下的描边会在身体里留下尖尖的线头
-        patch.lineWidth = 2.2 * sw; patch.lineCapStyle = .round; ink.setStroke(); patch.stroke()
-        if behind > 0.5 {                                    // 手背到身后：躯干和腿重新盖在手臂上面（只盖肩膀以下，别压到脸）
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: NSRect(x: 0, y: (17.2 + p.hop) * u, width: bounds.width, height: bounds.height)).addClip()
-            stroke(body, 2.2, ink)
-            NSGraphicsContext.restoreGraphicsState()
+        // 最上面两层：手臂，然后花球（手背在身后时它们已经在前面画过了）
+        if !armsBehind {
+            stroke(arms, 2.2, ink)
+            let patch = NSBezierPath()                 // 手臂的描边会在肩膀处横切过躯干，用一段躯干本体盖回去
+            let neckT = 1.9 / max(hipY - 14.4 - p.hop, 0.1)
+            patch.move(to: pt(19 + p.lean * (1 - neckT), 16.3 + p.hop)); patch.line(to: pt(19, hipY))       // 盖整段躯干：只盖肩膀那一小截的话，剩下的描边会在身体里留下尖尖的线头
+            patch.lineWidth = 2.2 * sw; patch.lineCapStyle = .round; ink.setStroke(); patch.stroke()
+            if behind < 0.95 { stroke(star, 2.0, accent) }
         }
-        if behind < 0.95 { stroke(star, 2.0, accent) }
     }
 
     /// 收起后的笑脸：嘴是一条往右上翘的线，末端带箭头，像一根上涨的走势
