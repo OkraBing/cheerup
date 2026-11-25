@@ -2020,7 +2020,8 @@ final class BoardView: NSView, NSTextFieldDelegate {
         // 手臂和花球的路径先算好，等脑袋画完再画，这样举起来时手和花球在脑袋前面
         var hands: [NSPoint] = []
         let arms = NSBezierPath()
-        for g in armPoints(p) {
+        let armGeo = armPoints(p)
+        for g in armGeo {
             let h = pt(g.h.x, g.h.y), e = pt(g.elbow.x, g.elbow.y)
             arms.move(to: pt(g.sh.x, g.sh.y)); arms.curve(to: h, controlPoint1: e, controlPoint2: e)
             hands.append(h)
@@ -2057,6 +2058,20 @@ final class BoardView: NSView, NSTextFieldDelegate {
             if behind < 0.95 { stroke(star, 2.0, accent) }
         }
         stroke(body, 2.2, ink)                       // 躯干和腿
+        if armsBehind {
+            // 躯干盖上去之后，它两侧的描边会从肩膀那里横着切过手臂的根部，像把胳膊切断了。
+            // 肩膀是连着的：把每条手臂从肩膀出来的那一小段本体再描一遍（不带描边），把那两道线盖掉；再往下才是躯干挡住手臂
+            let roots = NSBezierPath()
+            for g in armGeo {
+                roots.move(to: pt(g.sh.x, g.sh.y))
+                for t in [0.1, 0.2, 0.3] as [CGFloat] {          // 沿着手臂的曲线取前三成
+                    let a = (1 - t) * (1 - t) * (1 - t), b = 3 * (1 - t) * t, c = t * t * t
+                    roots.line(to: pt(a * g.sh.x + b * g.elbow.x + c * g.h.x, a * g.sh.y + b * g.elbow.y + c * g.h.y))
+                }
+            }
+            roots.lineWidth = 2.2 * sw; roots.lineCapStyle = .round; roots.lineJoinStyle = .round
+            ink.setStroke(); roots.stroke()
+        }
 
         // 睡着时的 z：漫画里那种一串斜体小 z，从头边冒出来，越飘越高、越大，然后淡掉。线很细，不抢戏
         if p.z > 0 {
