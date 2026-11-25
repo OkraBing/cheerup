@@ -5,7 +5,18 @@ cd "$(dirname "$0")"
 APP="CheerUp.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-swiftc -O main.swift -o "$APP/Contents/MacOS/CheerUp"
+# 同时编出苹果芯片和 Intel 两种，合成一个；哪种编不出来就只用本机这一种
+# -file-prefix-map 把源码所在的目录从程序里抹掉，编出来的程序不带本机路径
+BIN="$APP/Contents/MacOS/CheerUp"
+FLAGS="-O -file-prefix-map $(pwd)=. -debug-prefix-map $(pwd)=."
+if swiftc $FLAGS -target arm64-apple-macos12 main.swift -o "$BIN.arm64" 2>/dev/null \
+   && swiftc $FLAGS -target x86_64-apple-macos12 main.swift -o "$BIN.x86_64" 2>/dev/null \
+   && lipo -create "$BIN.arm64" "$BIN.x86_64" -output "$BIN" 2>/dev/null; then
+  rm -f "$BIN.arm64" "$BIN.x86_64"
+else
+  rm -f "$BIN.arm64" "$BIN.x86_64"
+  swiftc $FLAGS main.swift -o "$BIN"
+fi
 if [ -f icon.icns ]; then mkdir -p "$APP/Contents/Resources"; cp icon.icns "$APP/Contents/Resources/icon.icns"; fi
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

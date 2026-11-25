@@ -18,7 +18,19 @@ A tiny floating stock ticker for macOS (China A-shares, Hong Kong, US). A cheerl
 
 ## 安装
 
-需要 macOS 12 或更高版本，以及 Xcode 命令行工具（`xcode-select --install`）。
+需要 macOS 12 或更高版本，苹果芯片和 Intel 芯片都可以。
+
+**一行命令（推荐）**：打开「终端」，粘贴下面这行回车。它会下载最新版、放到桌面、然后打开。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OkraBing/cheerup/main/install.sh | bash
+```
+
+装好后桌面上会多一个 CheerUp，小窗出现在屏幕右下角，屏幕顶部栏里也有它的图标（点一下隐藏 / 显示）。
+
+**手动下载**：到 [Releases](https://github.com/OkraBing/cheerup/releases/latest) 下载 `CheerUp.zip`，解压后把 CheerUp 拖到桌面或「应用程序」。程序没有苹果的开发者签名，第一次打开要右键点它 →「打开」。
+
+**自己编译**：需要 Xcode 命令行工具（`xcode-select --install`）。
 
 ```bash
 git clone https://github.com/OkraBing/cheerup.git
@@ -26,8 +38,6 @@ cd cheerup
 bash build.sh
 open CheerUp.app
 ```
-
-程序没有苹果的开发者签名。如果是别人编译好发给你的，第一次打开要右键点它 →「打开」。
 
 ## 使用
 
@@ -45,7 +55,7 @@ open CheerUp.app
 | `⌃⌥S` | 隐藏 / 显示 |
 | 点顶部栏的小窗图标 | 隐藏 / 显示 |
 
-设置里可以改拉拉队的大小、花球配色、作息跟随哪个市场、展开面板时它还站不站在上面（关掉后展开只有面板，标题条多一个「隐藏」按钮；收起后仍然是它），以及界面大小（小 / 中 / 大 / 特大，文字和间距一起等比放大）、语言和登录时打开。
+设置里可以改拉拉队的大小、花球配色、作息跟随哪个市场、看行情时要不要显示它（关掉后只有行情面板，标题条多一个「退出」按钮；收起后仍然是它），以及界面大小（小 / 中 / 大 / 特大，文字和间距一起等比放大）、语言和登录时打开。
 
 ## 配置文件
 
