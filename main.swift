@@ -3135,15 +3135,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 顶部栏图标：小窗里一条带箭头的走势线。模板图，系统会按深浅色自动上色
     static func barIcon() -> NSImage {
-        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
-            // 圆角小窗里一条带箭头的上扬走势线。占满 18 点的格子，和旁边的系统图标一样大
+        // 和系统的电池图标同一种画法：一圈细的、半透明的圆角外框，里面的图形是实的。
+        // 里面是一条往上走的走势线，线头不是箭头，而是一个花球
+        let img = NSImage(size: NSSize(width: 22, height: 18), flipped: true) { _ in
+            let frame = NSBezierPath(roundedRect: NSRect(x: 0.75, y: 2.75, width: 20.5, height: 12.5), xRadius: 3.6, yRadius: 3.6)
+            NSColor.black.withAlphaComponent(0.5).setStroke()
+            frame.lineWidth = 1.0; frame.stroke()
             NSColor.black.setStroke()
-            let frame = NSBezierPath(roundedRect: NSRect(x: 0.9, y: 2.3, width: 16.2, height: 13.4), xRadius: 3.8, yRadius: 3.8)
-            frame.lineWidth = 1.5; frame.stroke()
             let line = NSBezierPath()
-            line.move(to: NSPoint(x: 4.2, y: 11.6)); line.line(to: NSPoint(x: 7.0, y: 8.9)); line.line(to: NSPoint(x: 9.4, y: 10.6)); line.line(to: NSPoint(x: 13.4, y: 6.6))
-            line.move(to: NSPoint(x: 10.6, y: 6.4)); line.line(to: NSPoint(x: 13.6, y: 6.4)); line.line(to: NSPoint(x: 13.6, y: 9.4))
-            line.lineWidth = 1.6; line.lineCapStyle = .round; line.lineJoinStyle = .round; line.stroke()
+            line.move(to: NSPoint(x: 4.3, y: 11.9)); line.line(to: NSPoint(x: 7.4, y: 9.2)); line.line(to: NSPoint(x: 9.6, y: 10.6)); line.line(to: NSPoint(x: 12.4, y: 8.0))
+            line.lineWidth = 1.5; line.lineCapStyle = .round; line.lineJoinStyle = .round; line.stroke()
+            let pom = NSBezierPath(), c = NSPoint(x: 15.0, y: 6.9), r: CGFloat = 2.5
+            for k in 0..<3 {
+                let a = CGFloat(k) * .pi / 3 + .pi / 6
+                pom.move(to: NSPoint(x: c.x - cos(a) * r, y: c.y - sin(a) * r)); pom.line(to: NSPoint(x: c.x + cos(a) * r, y: c.y + sin(a) * r))
+            }
+            pom.lineWidth = 1.5; pom.lineCapStyle = .round; pom.stroke()
             return true
         }
         img.isTemplate = true
@@ -4180,7 +4187,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--search") {       // 调试用
     RunLoop.main.run()
 }
 if let i = CommandLine.arguments.firstIndex(of: "--baricon"), i + 1 < CommandLine.arguments.count {     // 调试用：把顶部栏图标存成图片
-    let big = NSImage(size: NSSize(width: 144, height: 144), flipped: false) { r in NSColor.white.setFill(); r.fill(); AppDelegate.barIcon().draw(in: r); return true }
+    let big = NSImage(size: NSSize(width: 144, height: 144), flipped: false) { r in NSColor.white.setFill(); r.fill(); let ic = AppDelegate.barIcon(); let h = r.width * ic.size.height / ic.size.width; ic.draw(in: NSRect(x: 0, y: (r.height - h) / 2, width: r.width, height: h)); return true }
     if let t = big.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1])) }
     exit(0)
 }
