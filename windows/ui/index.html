@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CheerUp</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 阶段 0 的占位画面：一块面板，上面站一个不动的小人，其余全是透明的 -->
+  <div id="edge"></div>
+  <canvas id="cheer" width="96" height="96" title=""></canvas>
+  <div id="panel">
+    <div class="head">
+      <span class="name">CheerUp</span><span class="tag">外壳测试 <span id="ver"></span></span>
+      <span class="grow"></span>
+      <button id="hide" class="link">隐藏</button>
+      <button id="quit" class="link">退出</button>
+    </div>
+    <div class="row">
+      <span>截图和屏幕共享里不显示</span>
+      <button id="capture" class="switch" role="switch" aria-checked="false"><i></i></button>
+    </div>
+    <div class="row">
+      <span>开机启动</span>
+      <button id="autostart" class="switch" role="switch" aria-checked="false"><i></i></button>
+    </div>
+    <div class="hint">按住面板空白处可以拖动 · 点小人它会举手</div>
+    <div class="diag" id="diag"></div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>

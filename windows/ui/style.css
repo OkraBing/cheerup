@@ -1,0 +1,38 @@
+/* 窗口本身是透明的：html 和 body 都不能有底色 */
+html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+body {
+  font: 12px/1.4 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  color: rgba(255, 255, 255, 0.92);
+  user-select: none; -webkit-user-select: none; cursor: default;
+}
+
+/* 窗口的边界：一圈很淡的虚线，只在测试版里有，方便看出「透明的地方」到底有多大 */
+#edge { position: fixed; inset: 0; border: 1px dashed rgba(255, 255, 255, 0.28); box-sizing: border-box; pointer-events: none; }
+
+#panel {
+  position: fixed; left: 12px; right: 12px; bottom: 12px; height: 150px; box-sizing: border-box;
+  padding: 9px 12px 8px;
+  background: rgba(28, 28, 30, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 12px;
+  display: flex; flex-direction: column; gap: 7px;
+}
+#cheer { position: fixed; right: 26px; bottom: 146px; width: 96px; height: 96px; }
+
+.head { display: flex; align-items: baseline; gap: 6px; }
+.name { font-weight: 600; font-size: 13px; }
+.tag { color: rgba(255, 255, 255, 0.5); font-size: 11px; }
+.grow { flex: 1; }
+.row { display: flex; align-items: center; justify-content: space-between; height: 22px; }
+.hint { color: rgba(255, 255, 255, 0.5); font-size: 11px; margin-top: 1px; }
+.diag { color: rgba(255, 255, 255, 0.38); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.diag .bad { color: #e8736b; }
+
+button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; }
+.link { color: rgba(255, 255, 255, 0.62); padding: 1px 5px; border-radius: 5px; font-size: 11px; }
+.link:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+
+.switch { width: 30px; height: 18px; border-radius: 9px; background: rgba(255, 255, 255, 0.2); position: relative; transition: background 0.15s; }
+.switch i { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
+.switch[aria-checked="true"] { background: #6bbd87; }
+.switch[aria-checked="true"] i { transform: translateX(12px); }
