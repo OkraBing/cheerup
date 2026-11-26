@@ -2,7 +2,7 @@
 
 # CheerUp
 
-一个停在屏幕角落的 macOS 盯盘小窗，支持 A 股、港股、美股，也能把国际金价、银价、油价加进来和黄金 ETF 一起看。面板上站着一个会跳舞的拉拉队员，收起后只剩它。
+一个停在屏幕角落的 macOS 盯盘小窗，支持 A 股、港股、美股，也能把金价、银价、油价加进来和黄金 ETF 一起看；各按各的习惯：对照 A 股的黄金产品时显示元/克（由国际报价和汇率折算，是参考价），对照港股、美股的产品时显示美元/盎司。面板上站着一个会跳舞的拉拉队员，收起后只剩它。
 
 A tiny floating stock ticker for macOS (China A-shares, Hong Kong, US). A cheerleader stands on top of the panel; minimised, only the cheerleader stays.
 

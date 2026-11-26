@@ -157,6 +157,7 @@ struct Quote {
     var low: Double
     var time: String
     var stamp: Date? = nil             // 最新一笔行情的时刻（已按所在市场的时区换算）
+    var unit = ""                      // 报价的单位（金价这类才有）：元/克、美元/盎司、美元/桶
     var f: [String] = []
     func str(_ i: Int) -> String { i < f.count ? f[i] : "" }
     func num(_ i: Int) -> Double? { i < f.count ? Double(f[i]) : nil }
@@ -267,6 +268,11 @@ func parseQuotes(_ text: String) -> [String: Quote] {
               let v = line.range(of: "v_") else { continue }
         let key = String(line[v.upperBound..<eq])
         let body = line[line.index(after: eq)...].trimmingCharacters(in: CharacterSet(charactersIn: "\"\n\r "))
+        if key == "whUSDCNY" {             // 美元兑人民币的汇率：只用来把国际金价折成元/克
+            let c = body.components(separatedBy: "~")
+            if c.count > 3, let r = Double(c[3]), r > 1 { out[key] = Quote(name: "USDCNY", code: "USDCNY", price: r, prevClose: r, open: r, high: r, low: r, time: "") }
+            continue
+        }
         if key.hasPrefix("hf_") {
             // 国际商品：现价, 涨跌幅, 买价, 卖价, 最高, 最低, 时间, 昨结, 开盘, …, 日期, 名称（时间是北京时间）
             let c = body.components(separatedBy: ",")
@@ -275,6 +281,7 @@ func parseQuotes(_ text: String) -> [String: Quote] {
             let cname = c[13].components(separatedBy: "（")[0]              // 「伦敦金（现货黄金）」只留「伦敦金」
             out[key] = Quote(name: cname, code: String(key.dropFirst(3)), price: price, prevClose: prev,
                              open: Double(c[8]) ?? 0, high: Double(c[4]) ?? 0, low: Double(c[5]) ?? 0, time: String(c[6].prefix(5)), stamp: stamp, f: [])
+            out[key]?.unit = key == "hf_CL" ? T("美元/桶", "USD/bbl") : (key == "hf_XAU" || key == "hf_GC" || key == "hf_XAG" || key == "hf_SI" ? T("美元/盎司", "USD/oz") : T("美元", "USD"))
             continue
         }
         let f = body.components(separatedBy: "~")
@@ -4359,6 +4366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for k in symbols where Market.of(k) != .cmdty {
             if let q = quotes[k], let r = referencePrice(forName: q.name), !ask.contains(r.code) { ask.append(r.code) }
         }
+        if ask.contains(where: { ["hf_XAU", "hf_GC", "hf_XAG", "hf_SI"].contains($0) }) { ask.append("whUSDCNY") }      // 折成元/克要用汇率
         guard !symbols.isEmpty,
               let url = URL(string: host("https://qt.gtimg.cn/") + "q=" + ask.joined(separator: ",")) else { render(); return }
         lastFetchAt = Date()
@@ -4452,7 +4460,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         attempt(0)
     }
 
-    func buildDetail(raw: String, q: Quote) -> Detail {
+    /// 金价、银价按国内的口径：元/克（国际报价是美元/盎司，÷ 31.1035 × 汇率）。
+    /// 银行积存金、上海黄金交易所都是这个单位。这是折算出来的参考价，和国内实际成交价会有一点差。拿不到汇率时原样返回
+    func inGrams(_ q: Quote, key: String) -> Quote {
+        guard ["hf_XAU", "hf_GC", "hf_XAG", "hf_SI"].contains(key), let rate = quotes["whUSDCNY"]?.price else { return q }
+        var g = q; let k = rate / 31.1035
+        g.price *= k; g.prevClose *= k; g.open *= k; g.high *= k; g.low *= k; g.unit = "元/克"
+        return g
+    }
+
+    func buildDetail(raw: String, q rawQ: Quote) -> Detail {
+        // 金价这一行自己住在 A 股页，按国内的口径显示
+        let q = inGrams(rawQ, key: apiSymbol(raw))
         let key = apiSymbol(raw)
         let mk = Market.of(key, type: q.str(61))
         func yi(_ v: Double?) -> String? {      // 单位：亿
@@ -4478,8 +4497,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add("open", T("今开", "Open"), price(q.open)); add("prev", T("昨收", "Prev"), price(q.prevClose))
         add("amount", T("成交额", "Value"), yi(amount)); if mk != .hk, mk != .aIndex { add("turnover", T("换手", "Turnover"), plain(38, "%")) }
         // 黄金 / 白银 / 原油相关的产品：多一行它跟的那个国际价格和今天的涨跌
-        if mk != .cmdty, let r = referencePrice(forName: q.name), let rq = quotes[r.code], rq.live {
-            core.append(Stat(id: "ref", label: T(r.zh, r.en), value: fmt(rq.price), tint: rq.dir))
+        if mk != .cmdty, let r = referencePrice(forName: q.name), let usd = quotes[r.code], usd.live {
+            // 各按各的习惯：A 股的黄金产品对照国内的克价；港股、美股的黄金产品对照国际上的美元/盎司
+            let cn = mk == .aStock || mk == .aIndex
+            let rq = cn ? inGrams(usd, key: r.code) : usd
+            let label = rq.unit == "元/克" ? T(r.zh + "/克", r.en + " ¥/g") : (r.code == "hf_CL" ? T(r.zh, r.en) : T(r.zh + "/盎司", r.en + " $/oz"))
+            if core.count % 2 == 1 { core.append(Stat(id: "", label: "", value: "")) }       // 前面是单数个：补一个空位，让价格和「今日」总在同一行
+            core.append(Stat(id: "ref", label: label, value: fmt(rq.price), tint: rq.dir))
             core.append(Stat(id: "refpct", label: T("今日", "Today"), value: String(format: "%+.2f%%", rq.pct), tint: rq.dir))
         }
         var buy = 0.0, sell = 0.0
@@ -4496,7 +4520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let spark = minutes[key]
         let total = mk.sessions.reduce(0) { $0 + $1.1 - $1.0 + 1 }
         let notOpen = !st.live && q.stamp.map { Date().timeIntervalSince($0) > 3600 * 6 } ?? true      // 今天还没有行情
-        return Detail(name: displayName(q, key: key), code: q.code + (mk.currency.isEmpty ? "" : " · " + mk.currency), statusText: status, live: st.live,
+        return Detail(name: displayName(q, key: key), code: q.code + (!q.unit.isEmpty ? " · " + q.unit : (mk.currency.isEmpty ? "" : " · " + mk.currency)), statusText: status, live: st.live,
                       direction: q.dir, price: q.price, prevClose: q.prevClose, open: q.open, high: q.high, low: q.low,
                       buy: buy, sell: sell, core: core, more: [],
                       spark: spark ?? [], avg: [], vols: minuteVols[key] ?? [], times: minuteTimes[key] ?? [],
@@ -4631,7 +4655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 rows.append(Row(cells: pad([Cell(text: alias ?? raw), Cell(text: "", right: true), Cell(text: T("代码有误", "Bad ticker"), right: true, dim: true)]), direction: 0))
                 continue
             }
-            guard let q = quotes[apiSymbol(raw)] else {
+            guard let q = quotes[apiSymbol(raw)].map({ inGrams($0, key: apiSymbol(raw)) }) else {
                 rows.append(Row(cells: pad([Cell(text: alias ?? raw), Cell(text: "", right: true),
                                             Cell(text: everLoaded ? T("无数据", "No data") : "—", right: true, dim: true)]), direction: 0))
                 continue
@@ -4793,6 +4817,11 @@ func selfTest() -> Int32 {
     check("美股 北京晚上 23 点交易中", Market.us.status(now: at("2026-11-25 23:00", sh), stamp: at("2026-11-25 09:59", ny)).text == "交易中")
     check("美股 盘前", Market.us.status(now: at("2026-11-25 08:00", ny), stamp: nil).text == "盘前")
     let hf = parseQuotes("v_hf_XAU=\"3576.36,-0.34,3576.36,3576.71,3607.02,3551.13,11:20:00,3588.55,3589.32,0,0,0,2026-11-26,伦敦金（现货黄金）\";")["hf_XAU"]
+    let both = parseQuotes("v_hf_XAU=\"3110.35,1.00,0,0,3200,3000,11:20:00,3079.55,3100,0,0,0,2026-11-26,伦敦金（现货黄金）\";v_whUSDCNY=\"310~美元人民币~USDCNY~7.0000~0~20261126133636~7~7\";")
+    check("金价原样是美元每盎司，汇率单独存", both["hf_XAU"]?.price == 3110.35 && both["whUSDCNY"]?.price == 7.0)
+    let ad = AppDelegate(); ad.quotes = both
+    let g = ad.inGrams(both["hf_XAU"]!, key: "hf_XAU")
+    check("金价折成元每克", abs(g.price - 700) < 0.01 && g.unit == "元/克" && abs(g.pct - 1.0) < 0.01 && ad.inGrams(both["hf_XAU"]!, key: "usGLD").price == 3110.35)
     check("商品行情解析", hf != nil && hf!.name == "伦敦金" && hf!.price == 3576.36 && hf!.prevClose == 3588.55 && hf!.high == 3607.02 && hf!.low == 3551.13 && hf!.time == "11:20" && abs(hf!.pct + 0.34) < 0.01)
     check("商品代码和归属", apiSymbol("hf_xau") == "hf_XAU" && Market.of("hf_XAU") == .cmdty && AppDelegate.tabOf("hf_GC") == "a" && isValidCode("hf_XAU"))
     check("黄金产品认得出", referencePrice(forName: "黄金ETF博时")?.code == "hf_XAU" && referencePrice(forName: "黄金主题LOF")?.code == "hf_XAU" && referencePrice(forName: "白银LOF")?.code == "hf_XAG" && referencePrice(forName: "原油LOF易方达")?.code == "hf_CL" && referencePrice(forName: "贵州茅台") == nil)
