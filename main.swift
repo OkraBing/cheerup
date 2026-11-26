@@ -29,7 +29,7 @@ struct Config: Decodable {
     var usGreenUp: Bool = true               // 美股页按当地习惯绿涨红跌
     var miniStyle: String = "cheer"          // 收起后的样子：cheer 啦啦队员 / face 笑脸
     var language: String = ""                // 界面语言：zh / en；空着表示还没选，先跟系统
-    var tabOrder: [String] = ["a", "hk", "us", "x"]      // 标签从左到右的顺序（x 是黄金等商品）
+    var tabOrder: [String] = ["a", "hk", "us"]      // 市场标签从左到右的顺序
     var uiSize: String = "m"                 // 面板整体大小：s / m / l / xl（文字、间距、图标一起等比放大）
     var mascotSize: String = "m"             // 收起后小人的大小：s / m / l
     var restSchedule: String = "auto"        // 小人什么时候休息：auto 跟随当前标签页的市场 / a / hk / us / never 永不休息
@@ -123,7 +123,7 @@ extension Config {
         if !["s", "m", "l"].contains(mascotSize) { c.mascotSize = "m" }
         if !["s", "m", "l", "xl"].contains(uiSize) { c.uiSize = "m" }
         var order: [String] = []                       // 顺序里只认三个市场，各出现一次；漏掉的补在后面
-        for id in tabOrder + ["a", "hk", "us", "x"] where ["a", "hk", "us", "x"].contains(id) && !order.contains(id) { order.append(id) }
+        for id in tabOrder + ["a", "hk", "us"] where ["a", "hk", "us"].contains(id) && !order.contains(id) { order.append(id) }
         c.tabOrder = order
         if !pomColors.contains(pomColor) { c.pomColor = "auto" }
         if !["auto", "a", "hk", "us", "never"].contains(restSchedule) { c.restSchedule = "auto" }
@@ -390,6 +390,16 @@ let commonIndexes: [(keys: [String], code: String, zh: String, en: String, short
     (["道琼斯", "道指", "dow", "dji"], "us.DJI", "道琼斯", "Dow Jones", ".DJI"),
     (["标普", "s&p", "sp500", "sp 500", "spx", "inx"], "us.INX", "标普500", "S&P 500", ".INX"),
 ]
+/// 黄金 ETF、白银基金、原油基金这类产品，背后跟的是哪个国际价格。展开它们的详情时把这个价格一起显示出来：
+/// 想看金价的人，多半是因为手里拿着这类产品
+func referencePrice(forName name: String) -> (code: String, zh: String, en: String)? {
+    let n = name.lowercased()
+    if n.contains("黄金") || n.contains("上海金") || n.contains("金etf") || n.contains("gold") { return ("hf_XAU", "金价", "Gold") }
+    if n.contains("白银") || n.contains("silver") { return ("hf_XAG", "银价", "Silver") }
+    if n.contains("原油") || n.contains("石油") || n.contains("crude") || n.contains(" oil") { return ("hf_CL", "油价", "Oil") }
+    return nil
+}
+
 /// 黄金、白银、原油这类商品。搜索接口搜不到它们，这里直接认常见的叫法
 let commonCommodities: [(keys: [String], code: String, zh: String, en: String, short: String)] = [
     (["黄金", "金价", "伦敦金", "现货黄金", "国际金价", "gold", "xau"], "hf_XAU", "伦敦金", "Gold (spot)", "XAU"),
@@ -406,7 +416,7 @@ func indexHits(_ raw: String, market: String?) -> [AppDelegate.SearchHit] {
         .map { .init(code: $0.code, name: T($0.zh, $0.en), shortCode: $0.short, market: "", tag: T("指数", "Index")) }
         + (q.count >= 1 ? commonCommodities.filter { e in e.keys.contains { $0.hasPrefix(q) || q.hasPrefix($0) } }
             .filter { _ in market == nil }
-            .map { .init(code: $0.code, name: T($0.zh, $0.en), shortCode: $0.short, market: "", tag: T("商品", "Commodity")) } : [])
+            .map { .init(code: $0.code, name: T($0.zh, $0.en), shortCode: $0.short, market: "", tag: T("国际行情", "Global price")) } : [])
 }
 
 /// 看起来像一个代码（不是名称）的输入，可能对应哪些行情代码。搜索服务不通或搜不到时，直接拿去问行情接口
@@ -2730,7 +2740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 重新算一遍作息，并按上面的规则清 manual。每 5 秒一次；改了设置、换了标签、点了气泡之后立刻再算一次
     func refreshMode() {
         let which = cfg.restSchedule == "auto" ? tab : cfg.restSchedule
-        let mk: Market = which == "us" ? .us : (which == "hk" ? .hk : (which == "x" ? .cmdty : .aStock))
+        let mk: Market = which == "us" ? .us : (which == "hk" ? .hk : .aStock)
         let live = which == "never" || mk.status(stamp: nil).live || ProcessInfo.processInfo.environment["PEEK_FORCE_LIVE"] != nil
         let key = cfg.restSchedule + "|" + which
         let sameMarket = key == scheduleKey
@@ -2900,9 +2910,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 某只股票属于哪一页：a / hk / us。写错的代码归到 A 股页，方便看到并改掉
     static func tabOf(_ raw: String) -> String {
         guard isValidCode(raw) else { return "a" }
-        switch Market.of(apiSymbol(raw)) { case .hk: return "hk"; case .us: return "us"; case .cmdty: return "x"; default: return "a" }
+        switch Market.of(apiSymbol(raw)) { case .hk: return "hk"; case .us: return "us"; default: return "a" }       // 金价这类商品不单开一页，和黄金 ETF 这些放在 A 股页一起看
     }
-    static var tabNames: [String: String] { ["a": T("A股", "CN"), "hk": T("港股", "HK"), "us": T("美股", "US"), "x": T("商品", "Comm.")] }
+    static var tabNames: [String: String] { ["a": T("A股", "CN"), "hk": T("港股", "HK"), "us": T("美股", "US")] }
     /// 有股票的市场才有标签页
     var tabIDs: [String] { cfg.tabOrder.filter { id in allStocks.contains { AppDelegate.tabOf($0) == id } } }
     var tab = "a" { didSet { if tab != oldValue { store.set(tab, forKey: "tab") } } }
@@ -3162,7 +3172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         tab = store.string(forKey: "tab") ?? "a"
-        for id in ["a", "hk", "us", "x"] {       // 先把上次存的行情读出来，小窗一出现就有数，不用等网络
+        for id in ["a", "hk", "us"] {       // 先把上次存的行情读出来，小窗一出现就有数，不用等网络
             if let t = try? String(contentsOf: configDir.appendingPathComponent("cache_\(id).txt"), encoding: .utf8) {
                 for (k, v) in parseQuotes(t) { quotes[k] = v }
             }
@@ -4337,13 +4347,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panel.isVisible, !mini else { render(); return }
         // 这一页的市场没在交易时，价格不会变：定时的那种刷新放慢到一分钟一次，少发一大半请求
         if auto, ProcessInfo.processInfo.environment["PEEK_FORCE_LIVE"] == nil {
-            let mk: Market = tab == "us" ? .us : (tab == "hk" ? .hk : (tab == "x" ? .cmdty : .aStock))
-            if !mk.status(stamp: nil).live, Date().timeIntervalSince(lastFetchAt) < 60 { return }
+            let mk: Market = tab == "us" ? .us : (tab == "hk" ? .hk : .aStock)
+            // 这一页里有金价这类几乎全天交易的品种时，A 股收盘后它们还在动，照常刷新
+            let hasCmdty = shown.contains { isValidCode($0) && Market.of(apiSymbol($0)) == .cmdty } && Market.cmdty.status(stamp: nil).live
+            if !mk.status(stamp: nil).live, !hasCmdty, Date().timeIntervalSince(lastFetchAt) < 60 { return }
         }
         var seen = Set<String>()
         let symbols = shown.filter(isValidCode).map(apiSymbol).filter { seen.insert($0).inserted }
+        // 这一页里有黄金、白银、原油相关的产品时，顺带把对应的国际价格一起问回来（同一个请求，不多发）
+        var ask = symbols
+        for k in symbols where Market.of(k) != .cmdty {
+            if let q = quotes[k], let r = referencePrice(forName: q.name), !ask.contains(r.code) { ask.append(r.code) }
+        }
         guard !symbols.isEmpty,
-              let url = URL(string: host("https://qt.gtimg.cn/") + "q=" + symbols.joined(separator: ",")) else { render(); return }
+              let url = URL(string: host("https://qt.gtimg.cn/") + "q=" + ask.joined(separator: ",")) else { render(); return }
         lastFetchAt = Date()
         requestCount += 1
         if let t = testHome { try? "\(requestCount)".write(toFile: t + "/requests", atomically: true, encoding: .utf8) }
@@ -4460,6 +4477,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 只留四个最常用的数。估值、市值、涨跌停、盘口这些专业指标不放进来，这不是给交易员用的工具
         add("open", T("今开", "Open"), price(q.open)); add("prev", T("昨收", "Prev"), price(q.prevClose))
         add("amount", T("成交额", "Value"), yi(amount)); if mk != .hk, mk != .aIndex { add("turnover", T("换手", "Turnover"), plain(38, "%")) }
+        // 黄金 / 白银 / 原油相关的产品：多一行它跟的那个国际价格和今天的涨跌
+        if mk != .cmdty, let r = referencePrice(forName: q.name), let rq = quotes[r.code], rq.live {
+            core.append(Stat(id: "ref", label: T(r.zh, r.en), value: fmt(rq.price), tint: rq.dir))
+            core.append(Stat(id: "refpct", label: T("今日", "Today"), value: String(format: "%+.2f%%", rq.pct), tint: rq.dir))
+        }
         var buy = 0.0, sell = 0.0
         if mk == .aStock { buy = q.num(7) ?? 0; sell = q.num(8) ?? 0 }          // 外盘 / 内盘，单位手
 
@@ -4772,7 +4794,8 @@ func selfTest() -> Int32 {
     check("美股 盘前", Market.us.status(now: at("2026-11-25 08:00", ny), stamp: nil).text == "盘前")
     let hf = parseQuotes("v_hf_XAU=\"3576.36,-0.34,3576.36,3576.71,3607.02,3551.13,11:20:00,3588.55,3589.32,0,0,0,2026-11-26,伦敦金（现货黄金）\";")["hf_XAU"]
     check("商品行情解析", hf != nil && hf!.name == "伦敦金" && hf!.price == 3576.36 && hf!.prevClose == 3588.55 && hf!.high == 3607.02 && hf!.low == 3551.13 && hf!.time == "11:20" && abs(hf!.pct + 0.34) < 0.01)
-    check("商品代码和归属", apiSymbol("hf_xau") == "hf_XAU" && Market.of("hf_XAU") == .cmdty && AppDelegate.tabOf("hf_GC") == "x" && isValidCode("hf_XAU"))
+    check("商品代码和归属", apiSymbol("hf_xau") == "hf_XAU" && Market.of("hf_XAU") == .cmdty && AppDelegate.tabOf("hf_GC") == "a" && isValidCode("hf_XAU"))
+    check("黄金产品认得出", referencePrice(forName: "黄金ETF博时")?.code == "hf_XAU" && referencePrice(forName: "黄金主题LOF")?.code == "hf_XAU" && referencePrice(forName: "白银LOF")?.code == "hf_XAG" && referencePrice(forName: "原油LOF易方达")?.code == "hf_CL" && referencePrice(forName: "贵州茅台") == nil)
     check("商品搜得到", indexHits("黄金", market: nil).contains { $0.code == "hf_XAU" } && indexHits("gold", market: nil).contains { $0.code == "hf_GC" } && !indexHits("黄金", market: "sh").contains { $0.code == "hf_XAU" })
     check("市场识别", Market.of("sh600519") == .aStock && Market.of("sh000001", type: "ZS") == .aIndex && Market.of("r_hk00700") == .hk && Market.of("usAAPL") == .us)
     let us = parseQuotes(line("usAAPL", price: "354.07", prev: "349.08").replacingOccurrences(of: "20261125104627", with: "2026-11-24 16:00:02"))["usAAPL"]
@@ -4790,7 +4813,7 @@ func selfTest() -> Int32 {
     check("分页归属", AppDelegate.tabOf("600519") == "a" && AppDelegate.tabOf("sh000001") == "a" && AppDelegate.tabOf("00700") == "hk" && AppDelegate.tabOf("hkHSI") == "hk"
           && AppDelegate.tabOf("AAPL") == "us" && AppDelegate.tabOf("us.IXIC") == "us" && AppDelegate.tabOf("茅台") == "a")
     check("动作首尾相接", cheerPose(at: 0).aL == -50 && cheerPose(at: 0.41) == Pose() && cheerPose(at: cheerRoutineLength - 0.001).aL < -49 && cheerRoutineLength > 5)
-    check("标签顺序", cfg("{}")?.tabOrder == ["a", "hk", "us", "x"] && cfg("{ \"tabOrder\": [\"us\", \"y\", \"us\"] }")?.tabOrder == ["us", "a", "hk", "x"])
+    check("标签顺序", cfg("{}")?.tabOrder == ["a", "hk", "us"] && cfg("{ \"tabOrder\": [\"us\", \"y\", \"us\"] }")?.tabOrder == ["us", "a", "hk"])
     check("界面大小", cfg("{}")?.uiSize == "m" && cfg("{ \"uiSize\": \"xl\" }")?.uiSize == "xl" && cfg("{ \"uiSize\": \"huge\" }")?.uiSize == "m")
     check("小人大小", cfg("{}")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"huge\" }")?.mascotSize == "m" && cfg("{ \"mascotSize\": \"l\" }")?.mascotSize == "l")
     check("花球颜色", cfg("{}")?.pomColor == "auto" && cfg("{ \"pomColor\": \"pink\" }")?.pomColor == "auto" && cfg("{ \"pomColor\": \"green\" }")?.pomColor == "green")
