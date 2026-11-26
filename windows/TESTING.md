@@ -10,8 +10,8 @@
 
 这一版是免安装的，不用装，解压就能跑。
 
-1. 把 `CheerUp-windows.zip` 传到 Windows 电脑上（微信、网盘、U 盘都行）。
-2. 在 zip 上**右键 →「全部解压缩」**，解压到桌面。不要在压缩包里直接双击 exe，那样它找不到旁边的文件。
+1. 在 Windows 电脑的浏览器里打开 <https://github.com/OkraBing/cheerup/releases/tag/win-shell-test-0.0.1>，点 `CheerUp-windows-shell-test.zip` 下载（不用登录）。也可以从 Mac 上用微信、网盘、U 盘传过去。
+2. 在下载好的 zip 上**右键 →「全部解压缩」**，解压到桌面。不要在压缩包里直接双击 exe，那样它找不到旁边的文件。
 3. 打开解压出来的 `CheerUp` 文件夹，里面有两个文件：`CheerUp.exe` 和 `WebView2Loader.dll`。两个要放在一起，不要单独挪走 exe。
 4. 双击 `CheerUp.exe`。Windows 会弹出蓝色的「Windows 已保护你的电脑」，这是因为程序没有花钱买微软的签名，不是出了问题。点 **更多信息** → **仍要运行**。（传文件时如果杀毒软件或浏览器提示「不常见的文件」，选「保留」或「信任」。）
 5. 如果弹出一个框说需要「WebView2」：点它给的链接装上微软的 WebView2 运行库，再双击 `CheerUp.exe`。Windows 11 和更新过的 Windows 10 都自带它，一般不会遇到。
