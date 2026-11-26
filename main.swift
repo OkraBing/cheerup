@@ -12,7 +12,7 @@ func systemLang() -> String { (Locale.preferredLanguages.first ?? "zh").hasPrefi
 // MARK: - 配置
 
 struct Config: Decodable {
-    var stocks: [String] = ["sh000001", "600519", "00700", "AAPL", "NVDA"]
+    var stocks: [String] = ["sh000001", "600519", "00700", "AAPL", "NVDA", "hf_XAU"]
     var aliases: [String: String] = [:]
     var refreshSeconds: Double = 3
     var opacity: Double = 0.95
@@ -86,7 +86,7 @@ var requestCount = 0     // 测试用：发出过多少次网络请求
 
 let defaultConfigText = """
 {
-  "stocks": ["sh000001", "600519", "00700", "AAPL", "NVDA"],
+  "stocks": ["sh000001", "600519", "00700", "AAPL", "NVDA", "hf_XAU"],
   "aliases": {},
   "refreshSeconds": 3,
   "opacity": 0.95,
